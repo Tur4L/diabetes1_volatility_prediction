@@ -3,25 +3,9 @@
 </h1>
 
 <h3>
-  About Files:
+  About Folders and Files:
 </h3>
 <h4>
   'src' folder:
 </h4>
-<ul>
-  <li>
-    <strong>File name: </strong>gp.py
-    <br>
-    <strong>Description: </strong>I have tried Gaussian Processing here
-  </li>
-  <li>
-    <strong>File name: </strong>arima.py
-    <br>
-    <strong>Description: </strong>I have implemented ARIMA model here
-  </li>
-  <li>
-    <strong>File name: </strong>graph_data.py
-    <br>
-    <strong>Description: </strong>Contains functions to graph the data and perform length of line analysis
-  </li>
-</ul>
+<strong>Description: </strong>Contains the codes for all the statistical and machine learning models used.
