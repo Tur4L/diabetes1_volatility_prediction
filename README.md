@@ -1,11 +1,16 @@
 <h1>
-  Volatility prediction in type 1 diabetes patients
+Volatility prediction in type 1 diabetes patients
 </h1>
 
+<h2>
+Overview:
+</h2>
+In this repo, I will be implementing statistical and machine learning models to predict glucose volatility in the blood of the type 1 diabetes patients.
+
+<h2>
+About Folders and Files:
+</h2>
 <h3>
-  About Folders and Files:
+'src' folder:
 </h3>
-<h4>
-  'src' folder:
-</h4>
-<strong>Description: </strong>Contains the codes for all the statistical and machine learning models used.
+Contains the codes for all the statistical and machine learning models used.
