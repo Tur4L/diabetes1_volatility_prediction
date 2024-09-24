@@ -5,21 +5,21 @@
 <h2>
   About Files:
 </h2>
-<lt>
-  <lr>
+<ul>
+  <li>
     <li>File name</li>
     <li>Description</li>
-  </lr>
-  <lr>
-    <li>gp.py</li>
-    <li>I have tried Gaussian Processing here</li>
-  </lr>
-  <lr>
-    <li>arima.py</li>
-    <li>I have implemented ARIMA model here</li>
-  </lr>
-  <lr>
-    <li>graph_data.py</li>
-    <li>contains functions to graph the data and perform length of line analysis</li>
-  </lr>
-</lt>
+  </li>
+  <li>
+    gp.py
+    I have tried Gaussian Processing here
+  </li>
+  <li>
+    arima.py
+    I have implemented ARIMA model here
+  </li>
+  <li>
+    graph_data.py
+    contains functions to graph the data and perform length of line analysis
+  </li>
+</ul>
