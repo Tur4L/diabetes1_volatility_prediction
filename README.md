@@ -2,9 +2,9 @@
   Volatility prediction in type 1 diabetes patients
 </h1>
 
-<h2>
+<h3>
   About Files:
-</h2>
+</h3>
 <ul>
   <li>
     <strong>File name: </strong>gp.py
