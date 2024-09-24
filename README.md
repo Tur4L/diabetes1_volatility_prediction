@@ -7,20 +7,18 @@
 </h2>
 <ul>
   <li>
-    <strong>File name: </strong> gp.py
+    <strong>File name: </strong>gp.py
     <br>
-    <strong>Description: </strong> I have tried Gaussian Processing here
+    <strong>Description: </strong>I have tried Gaussian Processing here
   </li>
   <li>
-    gp.py
-    I have tried Gaussian Processing here
+    <strong>File name: </strong>arima.py
+    <br>
+    <strong>Description: </strong>I have implemented ARIMA model here
   </li>
   <li>
-    arima.py
-    I have implemented ARIMA model here
-  </li>
-  <li>
-    graph_data.py
-    contains functions to graph the data and perform length of line analysis
+    <strong>File name: </strong>graph_data.py
+    <br>
+    <strong>Description: </strong>Contains functions to graph the data and perform length of line analysis
   </li>
 </ul>
