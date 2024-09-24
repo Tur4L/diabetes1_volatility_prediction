@@ -7,8 +7,9 @@
 </h2>
 <ul>
   <li>
-    <li>File name</li>
-    <li>Description</li>
+    <strong>File name: </strong> gp.py
+    <br>
+    <strong>Description: </strong> I have tried Gaussian Processing here
   </li>
   <li>
     gp.py
