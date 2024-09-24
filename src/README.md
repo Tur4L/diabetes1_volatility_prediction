@@ -1,20 +1,18 @@
+<h1>
+About Files:
+</h1>
+
 <h2>
-  About Files:
+gp.py
 </h2>
-<ul>
-  <li>
-    <strong>File name: </strong>gp.py
-    <br>
-    <strong>Description: </strong>I have tried Gaussian Processing here
-  </li>
-  <li>
-    <strong>File name: </strong>arima.py
-    <br>
-    <strong>Description: </strong>I have implemented ARIMA model here
-  </li>
-  <li>
-    <strong>File name: </strong>graph_data.py
-    <br>
-    <strong>Description: </strong>Contains functions to graph the data and perform length of line analysis
-  </li>
-</ul>
+I have tried Gaussian Processing here. Currently, data is too big for a simple GP. I will attempt different GP methods in the future.
+
+<h2>
+arima.py
+</h2>
+I have implemented the ARIMA model here. Currently, running into a convergence problem.
+
+<h2>
+graph_data.py
+</h2>
+I have implemented graph_data() and length_data() functions. They can be used for length-of-line analysis.
