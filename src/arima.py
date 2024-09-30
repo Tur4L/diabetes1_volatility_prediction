@@ -8,13 +8,12 @@ from statsmodels.graphics.tsaplots import plot_pacf, plot_acf
 
 db = pd.read_csv('./data/normalized_JS_JT_KB.csv')
 patients_group = db.groupby('patient_id')
-arima_order = [(26, 0 , 7), (15, 0 , 7), (26, 0, 5), (12, 0, 6)]
+arima_order = [(26, 0 , 7), (15, 0 , 4), (20, 0, 5), (11, 0, 5)]
 for patient_id, patient_data in patients_group:
     patient_data.set_index('timestamp', inplace=True)
     ''' Performing ADF test to check stationarity. Current p-values: [2.0475783368680417e-28, 0 , 0, 0] '''
     # adf_test = adfuller(patient_data['glucose mmol/l'])
     # print(f"\nPatient {patient_id}: ")
-    # print(patient_data)
     # print(f'ADF-Statistics: {adf_test[0]}')
     # print(f'p-value: {adf_test[1]}')
     # print("Critical values: ")
@@ -31,7 +30,7 @@ for patient_id, patient_data in patients_group:
 
     ''' Orders determined by ACF and PACF: '''
     # Patient_id = 1: q = 26, p = 7
-    # Patient_id = 2: q = 15, p = 7
+    # Patient_id = 2: q = 15, p = 4
     # Patient_id = 3: q = 26, p = 5
     # Patient_id = 4: q = 12, p = 6
 
@@ -54,4 +53,3 @@ for patient_id, patient_data in patients_group:
     print(f"Patient {patient_id} MAE: {mean_absolute_error(forecast_db['actuals'],forecast_db['predictions'])}")
     print(f"Patient {patient_id} MAPE: {mean_absolute_percentage_error(forecast_db['actuals'],forecast_db['predictions'])}")
     print(f"Patient {patient_id} MSE: {mean_squared_error(forecast_db['actuals'],forecast_db['predictions'])}")
-
