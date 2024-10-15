@@ -56,13 +56,13 @@ from statsmodels.graphics.tsaplots import plot_pacf, plot_acf
 #     print(f"Patient {patient_id} MSE: {mean_squared_error(forecast_db['actuals'],forecast_db['predictions'])}")
 
 ''' For db with single window '''
-db = pd.read_csv('./data/db_window_random.csv')
+db = pd.read_csv('./data/db_window_random_10days.csv')
 db['timestamp'] = pd.to_datetime(db['timestamp'])
 db.set_index('timestamp', inplace=True)
 patient_id = db['patient_id'][0]
 
 
-''' Performing ADF test to check stationarity. Current p-values: 0 '''
+''' Performing ADF test to check stationarity. Current p-values: 0'''
 # adf_test = adfuller(db['glucose mmol/l'])
 # print(f"\nPatient {patient_id}: ")
 # print(f'ADF-Statistics: {adf_test[0]}')
@@ -72,20 +72,17 @@ patient_id = db['patient_id'][0]
 #     print(f'   {key}: {value}')
 
 ''' Plotting ACF and PACF for the ARIMA order'''
-# fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(100, 100), dpi=100)
-# plot_acf(db['glucose mmol/l'])
-# plot_pacf(db['glucose mmol/l'], method='ywm')
-# ax1.tick_params(axis='both', labelsize=12)
-# ax2.tick_params(axis='both', labelsize=12)
-# plt.show()
-
-''' Orders determined by ACF and PACF: '''
-# Patient_id = 4: q = 6, p = 3
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(100, 100), dpi=100)
+plot_acf(db['glucose mmol/l'])
+plot_pacf(db['glucose mmol/l'], method='ywm')
+ax1.tick_params(axis='both', labelsize=12)
+ax2.tick_params(axis='both', labelsize=12)
+plt.show()
 
 ''' Creating ARIMA model'''
-train = db.iloc[:int(0.80 * len(db))]
-test = db.iloc[int(0.80 * len(db)):]
-model = ARIMA(train['glucose mmol/l'], order=(3, 0, 6))
+train = db.iloc[:-6]
+test = db.iloc[-6:]
+model = ARIMA(train['glucose mmol/l'], order=(3, 0, 6),)
 model_fit = model.fit()
 
 forecast = model_fit.forecast(len(test))
@@ -107,8 +104,16 @@ print(f"Patient {patient_id} MSE: {mean_squared_error(actuals,forecast)}")
 
 ''' Plotting: '''
 # plt.plot(train['glucose mmol/l'], label='Observed')
-plt.plot(forecast_index, forecast, label='Forecast', color='red')
-plt.plot(forecast_index, actuals, label='Actual', color = 'blue')
+plt.plot(test.index.strftime('%H:%M'), forecast, label='Forecast', color='red')
+plt.plot(test.index.strftime('%H:%M'), actuals, label='Actual', color = 'blue')
 # plt.fill_between(forecast_index, conf_int[:, 0], conf_int[:, 1], color='pink', alpha=0.3)
+plt.ylim(6,10)
 plt.legend()
 plt.show()
+
+''' Table of predictions/actuals '''
+results ={'Actuals' : actuals.reset_index(drop=True), 'Predictions' : forecast.reset_index(drop=True), 'Residuals' : actuals.reset_index(drop=True) - forecast.reset_index(drop=True) }
+
+db_results = pd.DataFrame(results)
+window_id = db['window_id'][0]
+db_results.to_csv(f'./data/predictions/arima/results_p{patient_id}_b2{window_id}.csv')
