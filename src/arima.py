@@ -82,7 +82,7 @@ plt.show()
 ''' Creating ARIMA model'''
 train = db.iloc[:-6]
 test = db.iloc[-6:]
-model = ARIMA(train['glucose mmol/l'], order=(3, 0, 6),)
+model = ARIMA(train['glucose mmol/l'], order=(3, 0, 6))
 model_fit = model.fit()
 
 forecast = model_fit.forecast(len(test))
