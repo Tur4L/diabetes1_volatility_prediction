@@ -13,6 +13,7 @@ db.set_index('timestamp', inplace=True)
 
 patient_id = db['patient_id'][0]
 window_id = db['window_id'][0]
+beta2_score = db['BETA2_score'][0]
 
 # train = db.iloc[:-6]
 test = db.iloc[-365:]
@@ -33,12 +34,12 @@ for i in range(test_size):
     best_aic = np.inf
     best_pq = None
     best_model = None
-    max_p = 3
-    max_q = 3
+    max_p = 4
+    max_q = 4
 
     for p in range(1,max_p):
         for q in range(max_q):
-            garch_model = arch_model(train, p=p, q=q)
+            garch_model = arch_model(train, vol='GARCH', p=p, q=q)
             garch_fit = garch_model.fit(disp='off')
             
             if garch_fit.aic < best_aic:
@@ -46,19 +47,19 @@ for i in range(test_size):
                 best_pq = (p, q)
                 best_model = garch_fit
 
-    pred = best_model.forecast(horizon=1,reindex=False)
+    pred = best_model.forecast(horizon=6,reindex=False)
     rolling_predictions.append(np.sqrt(pred.variance.values[-1,:][-1]))
 
 rolling_predictions = pd.Series(rolling_predictions,index=test.index)    
 
 ''' Plotting'''
-print(len(test['glucose mmol/l pct_chng']))
-print(len(rolling_predictions))
+print(f'Patient {patient_id}, Window: {window_id}')
+print(f'Best P,Q : {best_pq}')
 plt.figure(figsize=(10, 6))
 plt.plot(test['glucose mmol/l pct_chng'], label='Glucose_pct_chng', color='blue')
 plt.plot(rolling_predictions, label='Predicted Volatility', color='red')
-plt.title(f'Patient {patient_id}')
+plt.title(f'BETA2 Score: {beta2_score}')
 plt.xlabel('Periods')
 plt.ylabel('Glucose Percentage Change')
 plt.legend()
-plt.savefig(f'./data/predictions/GARCH/p{patient_id}_b2{window_id}.png')
+plt.savefig(f'./data/predictions/garch/GARCH/p{patient_id}_b2{window_id}.png')

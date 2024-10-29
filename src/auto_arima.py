@@ -92,13 +92,14 @@ print(f"Patient {patient_id} MSE: {mean_squared_error(actuals_90mins,forecast_90
 
 ''' Plotting: '''
 # plt.plot(train['glucose mmol/l'], label='Observed')0
-plt.plot(test_90mins.index.strftime('%H:%M'), forecast_90mins, label='Forecast', color='red')
-plt.plot(test_90mins.index.strftime('%H:%M'), actuals_90mins, label='Actual', color = 'blue')
-plt.fill_between(test_90mins.index.strftime('%H:%M'), conf_int_90mins[:, 0], conf_int_90mins[:, 1], color='pink', alpha=0.3)
+plt.plot(['00:15','00:30','00:45','01:00','01:15','01:30'], forecast_90mins, label='Forecast', color='red')
+plt.plot(['00:15','00:30','00:45','01:00','01:15','01:30'], actuals_90mins, label='Actual', color = 'blue')
+plt.fill_between(['00:15','00:30','00:45','01:00','01:15','01:30'], conf_int_90mins[:, 0], conf_int_90mins[:, 1], color='pink', alpha=0.3)
 plt.ylim(int(actuals_90mins.min() - 1), int(actuals_90mins.max() + 1))
 plt.title(f'Beta2 score: {beta2_score}')
 plt.legend()
-plt.show()
+plt.savefig(f'./data/predictions/auto_arima/p{patient_id}_b2{window_id}.png')
+
 
 ''' Table of predictions/actuals '''
 results ={'Actuals' : actuals_90mins.reset_index(drop=True), 'Predictions' : forecast_90mins.reset_index(drop=True),
@@ -107,6 +108,7 @@ results ={'Actuals' : actuals_90mins.reset_index(drop=True), 'Predictions' : for
 db_results = pd.DataFrame(results)
 window_id = db['window_id'][0]
 db_results.to_csv(f'./data/predictions/auto_arima/p{patient_id}_b2{window_id}.csv')
+
 
 #-----------------------------------------------------------------------------------------------------
 # ''' For multiple windows '''
