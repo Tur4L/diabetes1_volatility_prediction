@@ -16,7 +16,7 @@ from keras.layers import *
 from keras.callbacks import ModelCheckpoint
 from keras.optimizers import Adam
 
-WINDOW_SIZE = 40
+WINDOW_SIZE = 8
 def seq_data(df, window_size):
     """
     Create sequential numpy data from df for lstm to process
@@ -43,11 +43,25 @@ def seq_data(df, window_size):
     current_index = 0
 
     for freq in frequencies:
-        if freq > window_size+5:
-            for i in range(freq-window_size-5):
+        if freq//6 > window_size:
+            for i in range(0, freq//6-window_size):
                 pt_id = input_data[current_index][0]
-                label = label_data[i+window_size+current_index+5]
-                row = [a for a in input_data[i + current_index: i + current_index + window_size]]
+                
+                ''' 5-minute intervals '''
+                # label = label_data[i+window_size+current_index+5]
+                # row = [a for a in input_data[i + current_index: i + current_index + window_size]]
+
+                ''' 30-minute intervals '''
+
+                row = [input_data[current_index + i *6 + j * 6] for j in range(window_size)]
+                label_index = current_index + (i + window_size) * 6
+                label = label_data[label_index]
+
+                ''' 90-minute intervals '''
+                # row = [input_data[current_index + i *18 + j * 18] for j in range(window_size)]
+                # label_index = current_index + (i + window_size) * 18
+                # label = label_data[label_index]
+
 
                 if pt_id in list(X.keys()):
                     X[pt_id].append(row)
@@ -69,7 +83,7 @@ if __name__ == '__main__':
     '''Data preprocessing step '''
     df = pd.read_csv('./data/normal/db_final.csv')
     df = df[['PtID','DeviceTm','Value','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c','Gender']]
-    X,y = seq_data(df, 8)
+    X,y = seq_data(df, WINDOW_SIZE)
 
     # with open('./data/normal/lstm.pkl', 'rb') as f:
     #     data = pickle.load(f)
@@ -97,7 +111,7 @@ if __name__ == '__main__':
         X_val = np.array(X_val)
         y_val = [label for pid in val_ids for label in y[pid]]
         y_val = np.array(y_val)
-
+        
         '''Creating LSTM model '''
         lstm_model = Sequential()
         lstm_model.add(InputLayer((X_train.shape[1], X_train.shape[2])))
@@ -153,4 +167,4 @@ if __name__ == '__main__':
                     label="Test Predictions", color="red")
             plt.plot(test_results['Actuals'][:100], label="Actuals", color="blue")
             plt.legend()
-            plt.savefig(f'./data/normal/predictions/lstm/30 min/test/test_ptid{int(test_id)}.png')
+            plt.savefig(f'./data/normal/predictions/lstm/30min/test/test_ptid{int(test_id)}.png')
