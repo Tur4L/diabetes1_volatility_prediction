@@ -12,78 +12,20 @@ from sklearn.model_selection import KFold
 
 import tensorflow as tf
 from keras.models import Sequential
+from keras.models import load_model
 from keras.layers import *
 from keras.callbacks import ModelCheckpoint
 from keras.optimizers import Adam
 
 WINDOW_SIZE = 8
-def seq_data(df, window_size):
-    """
-    Create sequential numpy data from df for lstm to process
-    Parameters:
-    - df: dataframe
-        df of patient data
-    - window_size: int
-        how far back to look
-
-    Returns:
-    - X: 
-        Numpy of X input
-    - y:
-        Numpy of y input
-
-    """
-
-    counts = df.groupby(['PtID']).size()
-    label_data = df['Value'].to_numpy()
-    input_data = df.to_numpy()
-    frequencies = counts.to_numpy()
-    X = {}
-    y = {}
-    current_index = 0
-
-    for freq in frequencies:
-        if freq//6 > window_size:
-            for i in range(0, freq//6-window_size):
-                pt_id = input_data[current_index][0]
-                
-                ''' 5-minute intervals '''
-                # label = label_data[i+window_size+current_index+5]
-                # row = [a for a in input_data[i + current_index: i + current_index + window_size]]
-
-                ''' 30-minute intervals '''
-
-                row = [input_data[current_index + i *6 + j * 6] for j in range(window_size)]
-                label_index = current_index + (i + window_size) * 6
-                label = label_data[label_index]
-
-                ''' 90-minute intervals '''
-                # row = [input_data[current_index + i *18 + j * 18] for j in range(window_size)]
-                # label_index = current_index + (i + window_size) * 18
-                # label = label_data[label_index]
-
-
-                if pt_id in list(X.keys()):
-                    X[pt_id].append(row)
-                    y[pt_id].append(label)
-
-                else:
-                    X[pt_id] = [row]
-                    y[pt_id] = [label]
-        current_index += freq
-
-    # with open('./data/normal/lstm.pkl','wb') as f:
-    #     pickle.dump({'X': X, 'y': y}, f)
-        
-    # print('Dictionary saved to lstm.pkl')
-    return X, y
+N_SPLIT = 5
 
 if __name__ == '__main__':
     
     '''Data preprocessing step '''
     df = pd.read_csv('./data/normal/db_final.csv')
     df = df[['PtID','DeviceTm','Value','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c','Gender']]
-    X,y = seq_data(df, WINDOW_SIZE)
+    X,y = lstm_data(df, WINDOW_SIZE)
 
     # with open('./data/normal/lstm.pkl', 'rb') as f:
     #     data = pickle.load(f)
@@ -92,7 +34,15 @@ if __name__ == '__main__':
     # y = data['y']
 
     pt_id = list(X.keys())
-    kf = KFold(n_splits=5, shuffle=True)
+    kf = KFold(n_splits=N_SPLIT, shuffle=True)
+
+    rmse = tf.keras.metrics.RootMeanSquaredError()
+    mae_score = 0
+    mape_score = 0
+    rmse_score = 0
+    grmse_score = 0
+    mard_score= 0
+    gmard_score = 0
 
     for fold, (train_idx, test_idx) in enumerate(kf.split(pt_id)):
         train_ids = [pt_id[i] for i in train_idx]
@@ -121,15 +71,17 @@ if __name__ == '__main__':
 
 
         cp = ModelCheckpoint(filepath='./data/normal/predictions/lstm/model', save_best_only=True)
-        lstm_model.compile(loss='mae', optimizer=Adam(learning_rate=0.0001), metrics=['mae'])
+        lstm_model.compile(loss='mae', optimizer=Adam(learning_rate=0.0001), metrics=[tf.keras.metrics.RootMeanSquaredError(), gRMSE, tf.keras.metrics.MeanAbsolutePercentageError(), MARD, gMARD])
         history = lstm_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, batch_size=10, callbacks=[cp])
 
         plt.plot(history.history['loss'], label='train')
         plt.plot(history.history['val_loss'], label='test')
         plt.legend()
-        plt.savefig('./data/normal/predictions/lstm/30min/loss.png')
+        plt.savefig('./data/normal/predictions/lstm/age_all/30min/loss.png')
 
         '''Performance on training data: '''
+        lstm_model = load_model("./data/normal/predictions/lstm/model/",
+                        custom_objects={'gRMSE': gRMSE, 'MARD': MARD, 'gMARD': gMARD, 'gMAE': gMAE})
         train_predictions = lstm_model.predict(X_train).flatten()
         train_results = pd.DataFrame(
             data={"Train Predictions": train_predictions, 'Actuals': y_train})
@@ -139,7 +91,7 @@ if __name__ == '__main__':
                 label="Train Predictions", color="red")
         plt.plot(train_results['Actuals'][:100], label="Actuals", color="blue")
         plt.legend()
-        plt.savefig('./data/normal/predictions/lstm/30min/train.png')
+        plt.savefig('./data/normal/predictions/lstm/age_all/30min/train.png')
 
         '''Performance on validation data: '''
         val_predictions = lstm_model.predict(X_val).flatten()
@@ -151,7 +103,7 @@ if __name__ == '__main__':
                 label="Validation Predictions", color="red")
         plt.plot(val_results['Actuals'][:100], label="Actuals", color="blue")
         plt.legend()
-        plt.savefig('./data/normal/predictions/lstm/30min/val.png')
+        plt.savefig('./data/normal/predictions/lstm/age_all/30min/val.png')
 
         '''Performance on test data: '''
 
@@ -159,6 +111,13 @@ if __name__ == '__main__':
             X_test = np.array(X[test_id])
             y_test = np.array(y[test_id])
             test_predictions = lstm_model.predict(X_test).flatten()
+
+            mae_score += tf.keras.metrics.MAE(y_test, test_predictions)
+            mape_score += tf.keras.metrics.MAPE(y_test, test_predictions)
+            rmse.update_state(y_true=y_test, y_pred=test_predictions)
+            rmse_score += rmse.result().numpy()
+
+
             test_results = pd.DataFrame(
                 data={"Test Predictions": test_predictions, 'Actuals': y_test})
 
@@ -167,4 +126,10 @@ if __name__ == '__main__':
                     label="Test Predictions", color="red")
             plt.plot(test_results['Actuals'][:100], label="Actuals", color="blue")
             plt.legend()
-            plt.savefig(f'./data/normal/predictions/lstm/30min/test/test_ptid{int(test_id)}.png')
+            plt.savefig(f'./data/normal/predictions/lstm/age_all/30min/test/test_ptid{int(test_id)}.png')
+
+    print('\nLSTM model statistics:')
+    print(f'\tMAE score: {mae_score/(len(test_ids) * N_SPLIT)}')
+    print(f'\tMAPE score: {mape_score/(len(test_ids) * N_SPLIT)}')
+    print(f'\tRMSE score: {rmse_score/(len(test_ids) * N_SPLIT)}')
+

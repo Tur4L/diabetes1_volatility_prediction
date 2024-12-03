@@ -28,11 +28,14 @@ def length_data(db):
     return distance_final, distance_final/len(db)
 
 if __name__ == "__main__":
-    db = pd.read_csv('./data/normalized_JS_JT_KB.csv')
-    grouped_patients = db.groupby('patient_id')
+    db = pd.read_csv('./data/type_1/db_windowed_all.csv')
+    grouped_patients = db.groupby('window_id')
+    
+    for window_id, patient_db in grouped_patients:
+        patient_id = patient_db.iloc[0,2]
+        beta2_score = patient_db.iloc[0,3]
+        print(f'Analysis for patient {patient_id}, BETA2 Score: {beta2_score}:')
 
-    for patient_id, patient_db in grouped_patients:
-        print(f'Analysis for patient {patient_id}:')
         length, norm_length = length_data(patient_db)
         print(f'\tTotal length is: {length}')
         print(f'\tNormalized length is: {norm_length}\n')

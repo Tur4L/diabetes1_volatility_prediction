@@ -210,306 +210,66 @@ def gMARD(y_true, y_pred, axis=None):
     gmard = tf.reduce_mean(product, axis=axis)
     return gmard
 
-
-def preprocess_numerical(X, X_train, np_column_list):
-    for column in np_column_list:
-        mean = np.mean(X_train[:, :, column])
-        std = np.std(X_train[:, :, column])
-        X[:, :, column] = (X[:, :, column] - mean) / std
-    return X
-
-
-def remove_id_columns(X, columns_list=[0, 1]):
-    """
-    Remove study ID and encounter number columns
-    Parameters:
-    - X: numpy 
-         with columns to be removed .
-    - columns_list: list of ints 
-         indices of cols to be removed
-    Returns: 
-        X: numpy 
-
-    """
-    X = np.delete(X, columns_list, 2)
-    return X
-
-
-def seq_data(df, window_size):
+def lstm_data(df, window_size):
     """
     Create sequential numpy data from df for lstm to process
     Parameters:
-    - df: dataframe 
-         df of processed dataset .
+    - df: dataframe
+        df of patient data
     - window_size: int
-         how far back to look
-    Returns: 
-        X: numpy
-          of X input
-        y: numpy
-         of y input
-        group_ids: list of str
-         ids (study_id) of each patient with their corresponding BG in the y array
-        average_y: numpy
-         of the corresponding patient's average BG for that entire encounter
+        how far back to look
+
+    Returns:
+    - X: 
+        Numpy of X input
+    - y:
+        Numpy of y input
 
     """
-    counts = df.groupby(['STUDY_ID', 'ENCOUNTER_NUM']).size()
-    glucose_df = make_average_prediction(df)
-    lstm_data = df.to_numpy()
+
+    counts = df.groupby(['PtID']).size()
+    label_data = df['Value'].to_numpy()
+    input_data = df.to_numpy()
     frequencies = counts.to_numpy()
-    X = []
-    y = []
-    average_y = []
-    group_ids = []
+    X = {}
+    y = {}
     current_index = 0
+
     for freq in frequencies:
-        if freq > window_size:
-            for i in range(freq-window_size):
-                study_id, encounter_number = int(
-                    lstm_data[current_index][0]), int(lstm_data[current_index][1])
-                group_ids.append(str(
-                    study_id))
-                # glucose level in the next meal
-                label = lstm_data[i+window_size+current_index][GLUCOSE_COL]
-                # all data from window_size number of previous meals
-                row = [a for a in lstm_data[i +
-                                            current_index:i+window_size+current_index]]
-                X.append(row)
-                y.append(label)
-                average_y.append(
-                    glucose_df.loc[study_id, encounter_number])
+        if freq//6 > window_size:
+            for i in range(0, freq//6-window_size):
+                pt_id = input_data[current_index][0]
+                
+                ''' 5-minute intervals '''
+                # label = label_data[i+window_size+current_index+5]
+                # row = [a for a in input_data[i + current_index: i + current_index + window_size]]
+
+                ''' 30-minute intervals '''
+
+                row = [input_data[current_index + i *6 + j * 6] for j in range(window_size)]
+                label_index = current_index + (i + window_size) * 6
+                label = label_data[label_index]
+
+                ''' 90-minute intervals '''
+                # row = [input_data[current_index + i *18 + j * 18] for j in range(window_size)]
+                # label_index = current_index + (i + window_size) * 18
+                # label = label_data[label_index]
+
+
+                if pt_id in list(X.keys()):
+                    X[pt_id].append(row)
+                    y[pt_id].append(label)
+
+                else:
+                    X[pt_id] = [row]
+                    y[pt_id] = [label]
         current_index += freq
 
-    return np.array(X).astype(float), np.array(y).astype(float), group_ids, np.array(average_y)
-
-
-def select_data(data_type, ids, group_ids, X, y):
-    """
-    Given a list of ids, return the corresponding entries in X and y
-    Parameters:
-    - data_type: str
-         "test" for test data, "average" for average BG, "fold" for fold train and val, else for normal selection .
-    - ids: list of str
-         list of ids we want to select
-    - group_ids: list of str
-         full list of ids for X and y
-    - X: numpy
-         numpy of input X
-    - y: numpy
-         numpy of output y
-    Returns: 
-        X: numpy
-          of X input after selection
-        y: numpy
-         of y input after selection
-    """
-    if data_type == "test":
-        mask = np.isin(group_ids, ids)
-        X_test, y_test = X[mask], y[mask]
-
-        patients = {}
-        patient_input = []
-        patient_actual = []
-        num_patient = 0
-        prev_stud_id = ""
-        prev_enc_id = ""
-
-        for list_index, data_list in enumerate(X_test):
-            stud_id = data_list[0][0]
-            enc_id = data_list[0][1]
-
-            if stud_id == prev_stud_id and enc_id == prev_enc_id:
-                patient_input.append(data_list)
-                patient_actual.append(y_test[list_index])
-            else:
-                if prev_stud_id != "" and prev_enc_id != "":
-                    patients[num_patient] = (
-                        remove_id_columns(patient_input), patient_actual)
-                    num_patient += 1
-
-                patient_input = [data_list]
-                patient_actual = [y_test[list_index]]
-
-            prev_stud_id = stud_id
-            prev_enc_id = enc_id
-
-        return patients, remove_id_columns(X_test), y_test
-
-    elif data_type == 'average':
-        mask = np.isin(group_ids, ids)
-        return y[mask]
-    elif data_type == 'fold':
-        mask = np.isin(group_ids, ids)
-        return X[mask], y[mask]
-    else:
-        mask = np.isin(group_ids, ids)
-        return remove_id_columns(X[mask]), y[mask]
-
-
-def KFold(k, train_ids):
-    """
-    Return k number of splits with k number of folds in each, in the form of ordered group ids
-    Parameters:
-    - k: int
-        number of folds .
-    - train_ids: list of ints
-        IDs we are using to sort X and y train .
-    Returns: 
-    - train_test_ids: list of lists of ints
-        splits with folds
-    """
-    split_ids = np.array_split(
-        train_ids, k)
-
-    train_test_ids = []
-
-    for i in range(k):
-        # Slicing the list
-        # Includes lists from the start up to and including index i
-        slice_up_to_i = split_ids[:i+1]
-        # Includes lists from just after index i to the end
-        slice_after_i = split_ids[i+1:]
-        train_list = [item for sublist in slice_up_to_i +
-                      slice_after_i for item in sublist]
-        val_list = split_ids[i]
-        train_test_ids.append([train_list, val_list])
-    return train_test_ids
-
-
-def plot(predictions, actuals, i, type, fig_name=None):
-    """
-    Plot predictions vs actuals
-    Parameters:
-    - predictions: numpy
-        of predictions .
-    - actuals: numpy
-         of actuals
-    - i: int
-        fold #
-    - type: str
-         type of prediction
-    - fig_name (opt): str
-        name of figure
-    Returns: 
-        None
-    """
-    results = pd.DataFrame(
-        data={type+"Predictions": predictions, 'Actuals': actuals})
-
-    plt.figure(figsize=(14, 8))
-    plt.plot(results[type+'Predictions'][:100],
-             label=type+" Predictions", color="red")
-    plt.plot(results['Actuals'][:100], label="Actuals", color="blue")
-    plt.ylabel('Patient Meal BG (mmol/L)')
-    plt.xlabel('Meals')
-    plt.legend()
-    if fig_name:
-        plt.savefig(fig_name)
-    else:
-        plt.savefig(f'./rnn/models/lstm_model/{i}_{type}.png')
-    plt.close()
-
-
-def make_average_prediction(df):
-    """
-    create a dataframe of average predictions for patients over their entire encounter
-    Parameters:
-    - df: dataframe
-         of input
-    Returns: 
-        None
-    """
-    mean_df = df.groupby(['STUDY_ID', 'ENCOUNTER_NUM'])[
-        "GLUCOSE (mmol/L)"].mean().rename('Mean Glucose')
-    return mean_df
-
-
-def test_errors(preds, actuals, axis=None):
-    """
-    Find errors of predictions vs actuals.
-    If provided array is 1D, it finds the errors of the test set and outputs a single number. 
-    If provided array is 2D, it finds the errors of the tests set row-wise and outputs lists of errors. 
-    Parameters
-    ----------
-    preds : 1D or 2D numpy array
-        Example: [14,10,12] or [[14],[10],[12]]
-        Numpy array of glucose predictions.
-    actuals: 1D or 2D array
-       Numpy array of glucose predictions.
-
-    Returns
-    -------
-    if array is 1D, return numbers (float) for each error.
-    if array is 2D, return list of floats for each error.
-
-    """
-
-    preds = tf.convert_to_tensor(preds, dtype=tf.float32)
-    actuals = tf.convert_to_tensor(
-        actuals, dtype=tf.float32)
-
-    t_MAE = tf.keras.losses.MAE(preds, actuals).numpy()
-    t_gMAE = gMAE(preds, actuals, axis=axis).numpy()
-    t_RMSE = tf.sqrt(tf.reduce_mean(
-        tf.square(tf.subtract(preds, actuals)), axis=axis)).numpy()
-    t_MAPE = tf.keras.losses.mean_absolute_percentage_error(
-        preds, actuals).numpy()
-    t_gRMSE = gRMSE(preds, actuals, axis=axis).numpy()
-    t_MARD = MARD(preds, actuals, axis=axis).numpy()
-    t_gMARD = gMARD(preds, actuals, axis=axis).numpy()
-
-    return t_MAE, t_gMAE, t_RMSE, t_gRMSE, t_MAPE, t_MARD, t_gMARD
-
-
-def find_confidence_errors_w_intervals(preds, actuals):
-    """
-    Find errors and confidence intervals of predictions vs actuals.
-    Parameters
-    ----------
-    preds : 1D or 2D numpy array
-        Example: [14,10,12] or [[14],[10],[12]]
-        Numpy array of glucose predictions.
-    actuals: 1D or 2D array
-       Numpy array of glucose predictions.
-
-    Returns
-    -------
-    errors: list of lists
-        return a list of lists of errors and intervals
-        ex: {[1.4,0.04]..}
-
-    """
-    interval = 0.90
-
-    # if 1D, convert to 2D
-    if len(preds.shape) == 1:
-        preds = preds.reshape(-1, 1)
-    if len(actuals.shape) == 1:
-        actuals = actuals.reshape(-1, 1)
-
-    # provide 1D, return error numbers
-    t_MAE, t_gMAE, t_RMSE, t_gRMSE, t_MAPE, t_MARD, t_gMARD = test_errors(
-        preds.flatten(), actuals.flatten())
-
-    # provide 2D,, return lists of errors
-    i_MAE, i_gMAE, i_RMSE, i_gRMSE, i_MAPE, i_MARD, i_gMARD = test_errors(
-        preds, actuals, axis=1)
-    errors_list = [i_MAE, i_gMAE, i_RMSE, i_gRMSE,
-                   i_MAPE, i_MARD, i_gMARD]
-    errors = [[t_MAE], [t_gMAE], [t_RMSE], [t_gRMSE], [
-        t_MAPE], [t_MARD], [t_gMARD]]
-
-    i = 0
-    # create 90% confidence interval
-    for i, _ in enumerate(errors):
-        i_error = errors_list[i]
-        interval_list = st.norm.interval(alpha=interval,
-                                         loc=np.mean(i_error),
-                                         scale=st.sem(i_error))
-        confidence = interval_list[1] - interval_list[0]
-        errors[i].append(confidence)
-    return errors
+    # with open('./data/normal/lstm.pkl','wb') as f:
+    #     pickle.dump({'X': X, 'y': y}, f)
+        
+    # print('Dictionary saved to lstm.pkl')
+    return X, y
 
 def transformer_data(df, encoder_length, prediction_length):
     """
