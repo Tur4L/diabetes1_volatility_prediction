@@ -282,12 +282,17 @@ def transformer_data(df, encoder_length, prediction_length):
 
     Returns
     -------
-    df_filtered : filtered dataframe for TFT model
+    tft_data : filtered dataframe for TFT model
 
     """
+    tft_ptid_list = []
+    grouped_df = df.groupby(['PtID'])
 
-    counts = df.groupby(['STUDY_ID', 'ENCOUNTER_NUM']).size()
-    min_data_points = encoder_length + prediction_length
-    valid = counts[counts >= min_data_points].index
-    df_filtered = df.set_index(['STUDY_ID', 'ENCOUNTER_NUM']).loc[valid].reset_index()
-    return df_filtered
+    for ptID, group_data in grouped_df:
+        if group_data.size >= encoder_length + prediction_length:
+            tft_ptid_list.append(ptID)
+
+    df['time_idx'] = df.groupby('PtID').cumcount()
+    tft_df = df[df['PtID'].isin(tft_ptid_list)]
+    tft_df = tft_df.drop(['DeviceTm','T1DBioFamily','T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk'], axis=1)
+    return tft_df
