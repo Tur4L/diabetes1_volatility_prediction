@@ -210,6 +210,94 @@ def gMARD(y_true, y_pred, axis=None):
     gmard = tf.reduce_mean(product, axis=axis)
     return gmard
 
+def test_errors(preds, actuals, axis=None):
+    """
+    Find errors of predictions vs actuals.
+    If provided array is 1D, it finds the errors of the test set and outputs a single number. 
+    If provided array is 2D, it finds the errors of the tests set row-wise and outputs lists of errors. 
+    Parameters
+    ----------
+    preds : 1D or 2D numpy array
+        Example: [14,10,12] or [[14],[10],[12]]
+        Numpy array of glucose predictions.
+    actuals: 1D or 2D array
+       Numpy array of glucose predictions.
+
+    Returns
+    -------
+    if array is 1D, return numbers (float) for each error.
+    if array is 2D, return list of floats for each error.
+
+    """
+
+    preds = tf.convert_to_tensor(preds, dtype=tf.float32)
+    actuals = tf.convert_to_tensor(
+        actuals, dtype=tf.float32)
+
+    t_MAE = tf.keras.losses.MAE(preds, actuals).numpy()
+    t_gMAE = gMAE(preds, actuals, axis=axis).numpy()
+    t_RMSE = tf.sqrt(tf.reduce_mean(
+        tf.square(tf.subtract(preds, actuals)), axis=axis)).numpy()
+    t_MAPE = tf.keras.losses.mean_absolute_percentage_error(
+        preds, actuals).numpy()
+    t_gRMSE = gRMSE(preds, actuals, axis=axis).numpy()
+    t_MARD = MARD(preds, actuals, axis=axis).numpy()
+    t_gMARD = gMARD(preds, actuals, axis=axis).numpy()
+
+    return t_MAE, t_gMAE, t_RMSE, t_gRMSE, t_MAPE, t_MARD, t_gMARD
+
+
+def find_confidence_errors_w_intervals(preds, actuals):
+    """
+    Find errors and confidence intervals of predictions vs actuals.
+    Parameters
+    ----------
+    preds : 1D or 2D numpy array
+        Example: [14,10,12] or [[14],[10],[12]]
+        Numpy array of glucose predictions.
+    actuals: 1D or 2D array
+       Numpy array of glucose predictions.
+
+    Returns
+    -------
+    errors: list of lists
+        return a list of lists of errors and intervals
+        ex: {[1.4,0.04]..}
+
+    """
+    interval = 0.90
+    preds = np.array([sublist[5] for sublist in preds])
+    actuals = np.array([sublist[5] for sublist in actuals])
+
+    # if 1D, convert to 2D
+    if len(preds.shape) == 1:
+        preds = preds.reshape(-1, 1)
+    if len(actuals.shape) == 1:
+        actuals = actuals.reshape(-1, 1)
+
+    # provide 1D, return error numbers
+    t_MAE, t_gMAE, t_RMSE, t_gRMSE, t_MAPE, t_MARD, t_gMARD = test_errors(
+        preds.flatten(), actuals.flatten())
+
+    # provide 2D,, return lists of errors
+    i_MAE, i_gMAE, i_RMSE, i_gRMSE, i_MAPE, i_MARD, i_gMARD = test_errors(
+        preds, actuals, axis=1)
+    errors_list = [i_MAE, i_gMAE, i_RMSE, i_gRMSE,
+                   i_MAPE, i_MARD, i_gMARD]
+    errors = [[t_MAE], [t_gMAE], [t_RMSE], [t_gRMSE], [
+        t_MAPE], [t_MARD], [t_gMARD]]
+
+    i = 0
+    # create 90% confidence interval
+    for i, _ in enumerate(errors):
+        i_error = errors_list[i]
+        interval_list = st.norm.interval(alpha=interval,
+                                         loc=np.mean(i_error),
+                                         scale=st.sem(i_error))
+        confidence = interval_list[1] - interval_list[0]
+        errors[i].append(confidence)
+    return errors
+
 def lstm_data(df, window_size):
     """
     Create sequential numpy data from df for lstm to process

@@ -1,5 +1,7 @@
+import sys
 import os
 import warnings
+import logging
 
 warnings.filterwarnings("ignore")
 
@@ -15,6 +17,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 from lightning.pytorch.tuner import Tuner
 from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.fabric.utilities.rank_zero import rank_zero_info
 
 from pytorch_forecasting import Baseline, TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer
@@ -22,6 +25,7 @@ from pytorch_forecasting.metrics import MAE, SMAPE, PoissonLoss, QuantileLoss
 from pytorch_forecasting.data.encoders import NaNLabelEncoder
 from pytorch_forecasting.models.temporal_fusion_transformer.tuning import optimize_hyperparameters
 # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 MAX_ENCODER_LENGTH = 12
 MAX_PREDICTION_LENGTH = 6
 TFT_RANGE = MAX_ENCODER_LENGTH + MAX_PREDICTION_LENGTH
@@ -36,6 +40,7 @@ tft_data.to_csv('./data/normal/db_tft.csv', index=False)
 #Creating KFolds:
 gkf = GroupKFold(n_splits=N_SPLIT)
 groups = tft_data['PtID']
+
 
 for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=groups)):
     train_val_df = tft_data.iloc[train_idx]
@@ -81,7 +86,7 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     # configure network and trainer
     early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
     lr_logger = LearningRateMonitor()  # log the learning rate
-    logger = TensorBoardLogger("./data/normal/predictions/tft")
+    logger = TensorBoardLogger(save_dir="./data/normal/predictions/tft",)
 
     trainer = pl.Trainer(
         max_epochs=20,
@@ -90,7 +95,7 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
         gradient_clip_val=0.041158135741519074,
         # limit_train_batches=50,
         callbacks=[lr_logger, early_stop_callback],
-        logger= logger
+        logger=logger
 )
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -111,7 +116,7 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     trainer.fit(
         tft,
         train_dataloaders=train_dataloader,
-        val_dataloaders=val_dataloader,
+        val_dataloaders=val_dataloader
     )
 
     # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -159,40 +164,39 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
 
     # Calculate errors
     grouped_test_data = test_df.groupby(["PtID"])
-    y_predictions = np.array([])
-    y_actuals = np.array([])
+    y_predictions = []
+    y_actuals = []
 
-    #loop over each patient-encounter
+    #loop over each patient
     for ptid, patient_data in grouped_test_data:
         index = 0
-        y_prediction = np.array([])
-        y_actual = np.array([])
+        y_prediction = []
+        y_actual = []
 
-        #loop for each patient
         for i in range(patient_data.shape[0] - TFT_RANGE):
             test_df_part = patient_data.iloc[index:index+TFT_RANGE]
             testing = TimeSeriesDataSet.from_dataset(training, test_df_part, predict= True, stop_randomization=True)
             test_dataloader = testing.to_dataloader(train=False, batch_size=320, num_workers = 0)
-            predictions = best_tft.predict(test_dataloader, return_y=True, trainer_kwargs=dict(accelerator="gpu"))
-            y_prediction = np.concatenate((y_prediction,np.array(predictions.output.T.tolist()[0])))
-            y_actual = np.concatenate((y_actual,np.array(predictions.y[0].T.tolist()[0])))
+            predictions = best_tft.predict(test_dataloader, return_y=True)
+            y_prediction.append(predictions.output.T.tolist())
+            y_actual.append(predictions.y[0].T.tolist())
             index += 1
 
-        y_predictions = np.concatenate((y_predictions,y_prediction))
-        y_actuals = np.concatenate((y_actuals,y_actual))
+        y_predictions.append(y_prediction)
+        y_actuals.append(y_actual)
 
-    print(y_predictions)
-    print(y_actuals)
 
-    # i_MAE,i_gMAE,i_RMSE,i_gRMSE,i_MAPE,i_MARD,i_gMARD = find_confidence_errors_w_intervals(np.array(list(y_predictions)),np.array(list(y_actuals)))
+    i_MAE,i_gMAE,i_RMSE,i_gRMSE,i_MAPE,i_MARD,i_gMARD = find_confidence_errors_w_intervals(y_predictions,y_actuals)
     # ce = clark_error_perc(list(y_actuals),list(y_predictions))
-    # print(f"i_MAE: {i_MAE[0]} +- {i_MAE[1]}")
-    # print(f"i_gMAE: {i_gMAE[0]} +- {i_gMAE[1]}")
-    # print(f"i_RMSE: {i_RMSE[0]} +- {i_RMSE[1]}")
-    # print(f"i_gRMSE: {i_gRMSE[0]} +- {i_gRMSE[1]}")
-    # print(f"i_MAPE: {i_MAPE[0]} +- {i_MAPE[1]}")
-    # print(f"i_MARD: {i_MARD[0]} +- {i_MARD[1]}")
-    # print(f"i_gMARD: {i_gMARD[0]} +- {i_gMARD[1]}")
+    print(f"i_MAE: {i_MAE[0]} +- {i_MAE[1]}")
+    print(f"i_gMAE: {i_gMAE[0]} +- {i_gMAE[1]}")
+    print(f"i_RMSE: {i_RMSE[0]} +- {i_RMSE[1]}")
+    print(f"i_gRMSE: {i_gRMSE[0]} +- {i_gRMSE[1]}")
+    print(f"i_MAPE: {i_MAPE[0]} +- {i_MAPE[1]}")
+    print(f"i_MARD: {i_MARD[0]} +- {i_MARD[1]}")
+    print(f"i_gMARD: {i_gMARD[0]} +- {i_gMARD[1]}")
+
+    break
     # print(f"Clark Error Grid: {ce}")
 
     # #Plots:
