@@ -41,7 +41,7 @@ tft_data.to_csv('./data/normal/db_tft.csv', index=False)
 gkf = GroupKFold(n_splits=N_SPLIT)
 groups = tft_data['PtID']
 
-
+t_MAE,t_gMAE,t_RMSE,t_gRMSE,t_MAPE,t_MARD,t_gMARD = [0.0,0.0], [0.0,0.0], [0.0,0.0], [0.0,0.0], [0.0,0.0], [0.0,0.0], [0.0,0.0]
 for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=groups)):
     train_val_df = tft_data.iloc[train_idx]
     train_groups, val_groups = train_test_split(train_val_df["PtID"].unique(), test_size=0.3, random_state=42)
@@ -188,27 +188,34 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
 
     i_MAE,i_gMAE,i_RMSE,i_gRMSE,i_MAPE,i_MARD,i_gMARD = find_confidence_errors_w_intervals(y_predictions,y_actuals)
     # ce = clark_error_perc(list(y_actuals),list(y_predictions))
-    print(f"i_MAE: {i_MAE[0]} +- {i_MAE[1]}")
-    print(f"i_gMAE: {i_gMAE[0]} +- {i_gMAE[1]}")
-    print(f"i_RMSE: {i_RMSE[0]} +- {i_RMSE[1]}")
-    print(f"i_gRMSE: {i_gRMSE[0]} +- {i_gRMSE[1]}")
-    print(f"i_MAPE: {i_MAPE[0]} +- {i_MAPE[1]}")
-    print(f"i_MARD: {i_MARD[0]} +- {i_MARD[1]}")
-    print(f"i_gMARD: {i_gMARD[0]} +- {i_gMARD[1]}")
+    t_MAE = list(np.add(t_MAE, i_MAE))
+    t_gMAE = list(np.add(t_gMAE, i_gMAE))
+    t_RMSE = list(np.add(t_RMSE, i_RMSE))
+    t_gRMSE = list(np.add(t_gRMSE, i_gRMSE))
+    t_MAPE = list(np.add(t_MAPE, i_MAPE))
+    t_MARD = list(np.add(t_MARD, i_MARD))
+    t_gMARD = list(np.add(t_gMARD, i_gMARD))
+    
+#Plots:
+raw_predictions = best_tft.predict(test_dataloader, mode="raw", return_x=True)
+prediction = 0
+for idx in range(10):  # plot 10 examples
+    best_tft.plot_prediction(raw_predictions.x, raw_predictions.output, idx=idx, add_loss_to_title=True,).savefig(f'./data/normal/predictions/tft/graph{prediction}.png')
+    prediction+= 1
+interpretation = best_tft.interpret_output(raw_predictions.output, reduction="sum")
 
-    break
-    # print(f"Clark Error Grid: {ce}")
+interpretations = 0
+interpretations_dict = best_tft.plot_interpretation(interpretation)
+for graph in interpretations_dict:
+    interpretations_dict[graph].savefig(f'./data/normal/predictions/tft/interpretation{interpretations}.png')
+    interpretations+=1
 
-    # #Plots:
-    # raw_predictions = best_tft.predict(test_dataloader, mode="raw", return_x=True)
-    # prediction = 0
-    # for idx in range(10):  # plot 10 examples
-    #     best_tft.plot_prediction(raw_predictions.x, raw_predictions.output, idx=idx, add_loss_to_title=True,).savefig(f'./models/tft/transformer_model/predictions/graph{prediction}.png')
-    #     prediction+= 1
-    # interpretation = best_tft.interpret_output(raw_predictions.output, reduction="sum")
-
-    # interpretations = 0
-    # interpretations_dict = best_tft.plot_interpretation(interpretation)
-    # for graph in interpretations_dict:
-    #     interpretations_dict[graph].savefig(f'./models/tft/transformer_model/interpretations/graph{interpretations}.png')
-    #     interpretations+=1
+#Metrics:
+print(f"t_MAE: {t_MAE[0]/N_SPLIT} +- {t_MAE[1]/N_SPLIT}")
+print(f"t_gMAE: {t_gMAE[0]/N_SPLIT} +- {t_gMAE[1]/N_SPLIT}")
+print(f"t_RMSE: {t_RMSE[0]/N_SPLIT} +- {t_RMSE[1]/N_SPLIT}")
+print(f"t_gRMSE: {t_gRMSE[0]/N_SPLIT} +- {t_gRMSE[1]/N_SPLIT}")
+print(f"t_MAPE: {t_MAPE[0]/N_SPLIT} +- {t_MAPE[1]/N_SPLIT}")
+print(f"t_MARD: {t_MARD[0]/N_SPLIT} +- {t_MARD[1]/N_SPLIT}")
+print(f"t_gMARD: {t_gMARD[0]/N_SPLIT} +- {t_gMARD[1]/N_SPLIT}")
+# print(f"Clark Error Grid: {ce}")
