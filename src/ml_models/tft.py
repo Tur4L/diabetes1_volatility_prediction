@@ -26,16 +26,18 @@ from pytorch_forecasting.data.encoders import NaNLabelEncoder
 from pytorch_forecasting.models.temporal_fusion_transformer.tuning import optimize_hyperparameters
 # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-MAX_ENCODER_LENGTH = 12
+MAX_ENCODER_LENGTH = 36
 MAX_PREDICTION_LENGTH = 6
 TFT_RANGE = MAX_ENCODER_LENGTH + MAX_PREDICTION_LENGTH
 N_SPLIT = 5
+
+logging.getLogger("lightning.pytorch.utilities.rank_zero").setLevel(logging.WARNING)
+logging.getLogger("lightning.pytorch.accelerators.cuda").setLevel(logging.WARNING)
 
 #Reading data
 df_path = "./data/normal/db_final.csv"
 df = pd.read_csv(df_path) 
 tft_data = transformer_data(df, MAX_ENCODER_LENGTH, MAX_PREDICTION_LENGTH)
-tft_data.to_csv('./data/normal/db_tft.csv', index=False)
 
 #Creating KFolds:
 gkf = GroupKFold(n_splits=N_SPLIT)
@@ -50,22 +52,18 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     val_df = train_val_df[train_val_df["PtID"].isin(val_groups)]
     test_df = tft_data.iloc[test_idx]
 
-    train_df.to_csv('./data/db_train.csv', index=False)
-    val_df.to_csv('./data/db_val.csv', index=False)
-    test_df.to_csv('./data/db_test.csv', index=False)
-
-
     #Time Series Data Set creating for TFT
     static_reals = ["AgeAsOfEnrollDt", "Weight", "Height","HbA1c",'Gender']
     time_varying_known_reals = []
     time_varying_unknown_reals = ['Value', 'Scaled_Value']
+    group_ids = ['PtID']
 
 
     training = TimeSeriesDataSet(
         train_df,
         time_idx="time_idx",
         target="Value",
-        group_ids=["PtID"],
+        group_ids=group_ids,
         max_encoder_length=MAX_ENCODER_LENGTH,
         max_prediction_length=MAX_PREDICTION_LENGTH,
         categorical_encoders={"PtID": NaNLabelEncoder(add_nan=True)},
@@ -79,8 +77,6 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     validation = TimeSeriesDataSet.from_dataset(training, val_df, predict= True, stop_randomization=True)
     train_dataloader = training.to_dataloader(train=True, batch_size=32, num_workers = 0)
     val_dataloader = validation.to_dataloader(train=False, batch_size=320, num_workers = 0)
-    
-    print(f"Validation Dataset Length: {len(validation)}")
 # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
     # configure network and trainer
@@ -89,7 +85,7 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     logger = TensorBoardLogger(save_dir="./data/normal/predictions/tft",)
 
     trainer = pl.Trainer(
-        max_epochs=20,
+        max_epochs=10,
         accelerator="gpu",
         enable_model_summary=True,
         gradient_clip_val=0.041158135741519074,
@@ -149,26 +145,21 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
 
     # Evaluate data:
     best_model_path = trainer.checkpoint_callback.best_model_path
+    # best_model_path = "./data/normal/predictions/tft/lightning_logs/version_9/checkpoints/epoch=9-step=65350.ckpt"
 
-    # best_model_path = "./models/tft/transformer_models/lightning_logs/lightning_logs/version_14/checkpoints/epoch=19-step=9020.ckpt"
-    # best_model_path = "./models/tft/transformer_model/lightning_logs/lightning_logs/version_15/checkpoints/epoch=19-step=9020.ckpt"
-    # best_model_path = "./models/tft/transformer_model/lightning_logs/lightning_logs/version_16/checkpoints/epoch=19-step=9020.ckpt"
-    # best_model_path = "./models/tft/transformer_model/lightning_logs/lightning_logs/version_17/checkpoints/epoch=15-step=7216.ckpt"
-    # best_model_path = "./models/tft/transformer_model/lightning_logs/lightning_logs/version_18/checkpoints/epoch=19-step=9020.ckpt"
-    # best_model_path = "./models/tft/transformer_model/lightning_logs/lightning_logs/version_20/checkpoints/epoch=19-step=8300.ckpt"
-    # best_model_path = "./models/tft/transformer_model/lightning_logs/lightning_logs/version_21/checkpoints/epoch=19-step=8300.ckpt"
-    # best_model_path = "./models/tft/transformer_model/lightning_logs/lightning_logs/version_22/checkpoints/epoch=19-step=8300.ckpt"
-    # best_model_path = "./models/tft/transformer_model/lightning_logs/lightning_logs/version_23/checkpoints/epoch=12-step=5395.ckpt"
-    # best_model_path = "./models/tft/transformer_model/lightning_logs/lightning_logs/version_24/checkpoints/epoch=19-step=8300.ckpt"
     best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
 
     # Calculate errors
     grouped_test_data = test_df.groupby(["PtID"])
+    grouped_test_data = grouped_test_data
+    grouped_len = len(grouped_test_data)
+
     y_predictions = []
     y_actuals = []
+    pt_num = 0
 
     #loop over each patient
-    for ptid, patient_data in grouped_test_data:
+    for idx, (ptid, patient_data) in enumerate(grouped_test_data):
         index = 0
         y_prediction = []
         y_actual = []
@@ -177,28 +168,72 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
             test_df_part = patient_data.iloc[index:index+TFT_RANGE]
             testing = TimeSeriesDataSet.from_dataset(training, test_df_part, predict= True, stop_randomization=True)
             test_dataloader = testing.to_dataloader(train=False, batch_size=320, num_workers = 0)
-            predictions = best_tft.predict(test_dataloader, return_y=True)
-            y_prediction.append(predictions.output.T.tolist())
-            y_actual.append(predictions.y[0].T.tolist())
+            predictions = best_tft.predict(test_dataloader, return_y=True, trainer_kwargs={'logger':False})
+            y_prediction.append(predictions.output.T.tolist()[5])
+            y_actual.append(predictions.y[0].T.tolist()[5])
             index += 1
 
+        pt_num += 1
+        print(f'Testing progress: {pt_num}/{grouped_len} done')
         y_predictions.append(y_prediction)
         y_actuals.append(y_actual)
 
 
     i_MAE,i_gMAE,i_RMSE,i_gRMSE,i_MAPE,i_MARD,i_gMARD = find_confidence_errors_w_intervals(y_predictions,y_actuals)
     # ce = clark_error_perc(list(y_actuals),list(y_predictions))
-    t_MAE = list(np.add(t_MAE, i_MAE))
-    t_gMAE = list(np.add(t_gMAE, i_gMAE))
-    t_RMSE = list(np.add(t_RMSE, i_RMSE))
-    t_gRMSE = list(np.add(t_gRMSE, i_gRMSE))
-    t_MAPE = list(np.add(t_MAPE, i_MAPE))
-    t_MARD = list(np.add(t_MARD, i_MARD))
-    t_gMARD = list(np.add(t_gMARD, i_gMARD))
-    
+
+    t_MAE[0] += i_MAE[0]
+    t_MAE[1] += i_MAE[1]
+
+    t_gMAE[0] += i_gMAE[0]
+    t_gMAE[1] += i_gMAE[1]
+
+    t_RMSE[0] += i_RMSE[0]
+    t_RMSE[1] += i_RMSE[1]
+
+    t_gRMSE[0] += i_gRMSE[0]
+    t_gRMSE[1] += i_gRMSE[1]
+
+    t_MAPE[0] += i_MAPE[0]
+    t_MAPE[1] += i_MAPE[1]
+
+    t_MARD[0] += i_MARD[0]
+    t_MARD[1] += i_MARD[1]
+
+    t_gMARD[0] += i_gMARD[0]
+    t_gMARD[1] += i_gMARD[1]
+
+#Metrics:
+metrics = {
+    'MAE': f'{t_MAE[0]/N_SPLIT} +- {t_MAE[1]/N_SPLIT}',
+    't_gMAE': f'{t_gMAE[0]/N_SPLIT} +- {t_gMAE[1]/N_SPLIT}',
+    't_RMSE': f'{t_RMSE[0]/N_SPLIT} +- {t_RMSE[1]/N_SPLIT}',
+    't_gRMSE': f'{t_gRMSE[0]/N_SPLIT} +- {t_gRMSE[1]/N_SPLIT}',
+    't_MAPE': f'{t_MAPE[0]/N_SPLIT} +- {t_MAPE[1]/N_SPLIT}',
+    't_MARD': f'{t_MARD[0]/N_SPLIT} +- {t_MARD[1]/N_SPLIT}',
+    't_gMARD': f'{t_gMARD[0]/N_SPLIT} +- {t_gMARD[1]/N_SPLIT}'
+}
+
+metrics_df = pd.DataFrame(metrics,index=[0])
+metrics_df.to_csv('./data/normal/predictions/tft/metrics.csv', index=False)
+
+
+print(f"t_MAE: {t_MAE[0]/N_SPLIT} +- {t_MAE[1]/N_SPLIT}")
+print(f"t_gMAE: {t_gMAE[0]/N_SPLIT} +- {t_gMAE[1]/N_SPLIT}")
+print(f"t_RMSE: {t_RMSE[0]/N_SPLIT} +- {t_RMSE[1]/N_SPLIT}")
+print(f"t_gRMSE: {t_gRMSE[0]/N_SPLIT} +- {t_gRMSE[1]/N_SPLIT}")
+print(f"t_MAPE: {t_MAPE[0]/N_SPLIT} +- {t_MAPE[1]/N_SPLIT}")
+print(f"t_MARD: {t_MARD[0]/N_SPLIT} +- {t_MARD[1]/N_SPLIT}")
+print(f"t_gMARD: {t_gMARD[0]/N_SPLIT} +- {t_gMARD[1]/N_SPLIT}")
+# print(f"Clark Error Grid: {ce}")
+
 #Plots:
 raw_predictions = best_tft.predict(test_dataloader, mode="raw", return_x=True)
 prediction = 0
+print("RAW PREDICTION X:")
+print(raw_predictions.x)
+print("\n\nRAW PREDICTION OUTPUT:")
+print(raw_predictions.output)
 for idx in range(10):  # plot 10 examples
     best_tft.plot_prediction(raw_predictions.x, raw_predictions.output, idx=idx, add_loss_to_title=True,).savefig(f'./data/normal/predictions/tft/graph{prediction}.png')
     prediction+= 1
@@ -210,12 +245,3 @@ for graph in interpretations_dict:
     interpretations_dict[graph].savefig(f'./data/normal/predictions/tft/interpretation{interpretations}.png')
     interpretations+=1
 
-#Metrics:
-print(f"t_MAE: {t_MAE[0]/N_SPLIT} +- {t_MAE[1]/N_SPLIT}")
-print(f"t_gMAE: {t_gMAE[0]/N_SPLIT} +- {t_gMAE[1]/N_SPLIT}")
-print(f"t_RMSE: {t_RMSE[0]/N_SPLIT} +- {t_RMSE[1]/N_SPLIT}")
-print(f"t_gRMSE: {t_gRMSE[0]/N_SPLIT} +- {t_gRMSE[1]/N_SPLIT}")
-print(f"t_MAPE: {t_MAPE[0]/N_SPLIT} +- {t_MAPE[1]/N_SPLIT}")
-print(f"t_MARD: {t_MARD[0]/N_SPLIT} +- {t_MARD[1]/N_SPLIT}")
-print(f"t_gMARD: {t_gMARD[0]/N_SPLIT} +- {t_gMARD[1]/N_SPLIT}")
-# print(f"Clark Error Grid: {ce}")
