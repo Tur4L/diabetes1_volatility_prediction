@@ -24,9 +24,10 @@ from pytorch_forecasting.data import GroupNormalizer
 from pytorch_forecasting.metrics import MAE, SMAPE, PoissonLoss, QuantileLoss
 from pytorch_forecasting.data.encoders import NaNLabelEncoder
 from pytorch_forecasting.models.temporal_fusion_transformer.tuning import optimize_hyperparameters
+
 # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-MAX_ENCODER_LENGTH = 36
+MAX_ENCODER_LENGTH = 12
 MAX_PREDICTION_LENGTH = 6
 TFT_RANGE = MAX_ENCODER_LENGTH + MAX_PREDICTION_LENGTH
 N_SPLIT = 5
@@ -103,7 +104,7 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
         hidden_continuous_size=34,
         loss=MAE(),
         log_interval=10,
-        optimizer="Ranger",
+        optimizer="Adam",
         reduce_on_plateau_patience=4,
     )
     print(f"Number of parameters in network: {tft.size()/1e3:.1f}k")
@@ -150,34 +151,31 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
 
     # Calculate errors
-    grouped_test_data = test_df.groupby(["PtID"])
-    grouped_test_data = grouped_test_data
-    grouped_len = len(grouped_test_data)
-
-    y_predictions = []
-    y_actuals = []
     pt_num = 0
+    grouped_test = test_df.groupby(['PtID'])
+    pt_length = len(grouped_test)
+    y_predictions = np.array([])
+    y_actuals = np.array([])
 
-    #loop over each patient
-    for idx, (ptid, patient_data) in enumerate(grouped_test_data):
-        index = 0
-        y_prediction = []
-        y_actual = []
+    #looping over each patient:
+    for ptid, group in grouped_test:
+        test_ptid = test_df.loc[test_df['PtID'] == ptid]
+        y_predictions_ptid = np.array([])
+        y_actuals_ptid = np.array([])
 
-        for i in range(patient_data.shape[0] - TFT_RANGE):
-            test_df_part = patient_data.iloc[index:index+TFT_RANGE]
-            testing = TimeSeriesDataSet.from_dataset(training, test_df_part, predict= True, stop_randomization=True)
-            test_dataloader = testing.to_dataloader(train=False, batch_size=320, num_workers = 0)
-            predictions = best_tft.predict(test_dataloader, return_y=True, trainer_kwargs={'logger':False})
-            y_prediction.append(predictions.output.T.tolist()[5])
-            y_actual.append(predictions.y[0].T.tolist()[5])
-            index += 1
+        for i in range(test_ptid.shape[0] - TFT_RANGE):
+            test_ptid_part = test_ptid.iloc[i : i + TFT_RANGE]
+            testing = TimeSeriesDataSet.from_dataset(training, test_ptid_part, predict=True, stop_randomization= True)
+            test_dataloader = testing.to_dataloader(train=False, batch_size=320)
+            ptid_predictions = best_tft.predict(test_dataloader, return_y= True, trainer_kwargs={'logger':False})
+            y_predictions_ptid = np.concatenate((y_predictions_ptid, np.array(ptid_predictions.output.T.tolist()[5])), axis=None)
+            y_actuals_ptid = np.concatenate((y_actuals_ptid, np.array(ptid_predictions.y[0].T.tolist()[5])), axis=None)
+        
+        pt_num+=1
 
-        pt_num += 1
-        print(f'Testing progress: {pt_num}/{grouped_len} done')
-        y_predictions.append(y_prediction)
-        y_actuals.append(y_actual)
-
+        y_predictions = np.concatenate((y_predictions, y_predictions_ptid), axis=None)
+        y_actuals = np.concatenate((y_actuals,y_actuals_ptid), axis=None)
+        print(f'Testing data gathered: {pt_num}/{pt_length}')
 
     i_MAE,i_gMAE,i_RMSE,i_gRMSE,i_MAPE,i_MARD,i_gMARD = find_confidence_errors_w_intervals(y_predictions,y_actuals)
     # ce = clark_error_perc(list(y_actuals),list(y_predictions))
@@ -230,15 +228,9 @@ print(f"t_gMARD: {t_gMARD[0]/N_SPLIT} +- {t_gMARD[1]/N_SPLIT}")
 #Plots:
 raw_predictions = best_tft.predict(test_dataloader, mode="raw", return_x=True)
 prediction = 0
-print("RAW PREDICTION X:")
-print(raw_predictions.x)
-print("\n\nRAW PREDICTION OUTPUT:")
-print(raw_predictions.output)
-for idx in range(10):  # plot 10 examples
-    best_tft.plot_prediction(raw_predictions.x, raw_predictions.output, idx=idx, add_loss_to_title=True,).savefig(f'./data/normal/predictions/tft/graph{prediction}.png')
-    prediction+= 1
-interpretation = best_tft.interpret_output(raw_predictions.output, reduction="sum")
+best_tft.plot_prediction(raw_predictions.x, raw_predictions.output, idx=0, add_loss_to_title=True,).savefig(f'./data/normal/predictions/tft/graph{prediction}.png')
 
+interpretation = best_tft.interpret_output(raw_predictions.output, reduction="sum")
 interpretations = 0
 interpretations_dict = best_tft.plot_interpretation(interpretation)
 for graph in interpretations_dict:

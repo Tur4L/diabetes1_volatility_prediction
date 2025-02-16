@@ -11,11 +11,11 @@ from sklearn.model_selection import KFold
 
 
 import tensorflow as tf
-from keras.models import Sequential
-from keras.models import load_model
-from keras.layers import *
-from keras.callbacks import ModelCheckpoint
-from keras.optimizers import Adam
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.models import load_model
+from tensorflow.keras.layers import *
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.optimizers import Adam
 
 WINDOW_SIZE = 8
 N_SPLIT = 5

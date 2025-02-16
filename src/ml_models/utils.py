@@ -266,8 +266,8 @@ def find_confidence_errors_w_intervals(preds, actuals):
 
     """
     interval = 0.90
-    preds = np.array([sublist[5] for sublist in preds])
-    actuals = np.array([sublist[5] for sublist in actuals])
+    preds = np.array([sublist for sublist in preds])
+    actuals = np.array([sublist for sublist in actuals])
 
     # if 1D, convert to 2D
     if len(preds.shape) == 1:
@@ -378,9 +378,11 @@ def transformer_data(df, encoder_length, prediction_length):
 
     for ptID, group_data in grouped_df:
         if group_data.size >= encoder_length + prediction_length:
-            tft_ptid_list.append(ptID)
+            tft_ptid_list.append(ptID[0])
 
     df['time_idx'] = df.groupby('PtID').cumcount()
     tft_df = df[df['PtID'].isin(tft_ptid_list)]
     tft_df = tft_df.drop(['DeviceTm','T1DBioFamily','T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk'], axis=1)
+    tft_df.to_csv('./data/normal/db_tft.csv', index= False)
+
     return tft_df
