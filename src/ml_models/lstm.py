@@ -71,7 +71,7 @@ if __name__ == '__main__':
         lstm_model.add(Dense(1, activation="linear"))
 
 
-        cp = ModelCheckpoint(filepath='./data/normal/predictions/lstm/model.keras', save_best_only=True)
+        cp = ModelCheckpoint(filepath='./data/normal/predictions/lstm/lstm_logs/', save_best_only=True)
         lstm_model.compile(loss='mae', optimizer=Adam(learning_rate=0.0001), metrics=[tf.keras.metrics.RootMeanSquaredError(), gRMSE, tf.keras.metrics.MeanAbsolutePercentageError(), MARD, gMARD])
         history = lstm_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, batch_size=10, callbacks=[cp])
 

@@ -1,5 +1,8 @@
-#data folder
-data/
+# Lightning logs
+lightning_logs/
+
+#LSTM logs
+lstm_logs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -17,6 +20,9 @@ __pycache__/
 
 # png files
 *.png
+
+# rtf file
+*.rtf
 
 # Distribution / packaging
 .Python
