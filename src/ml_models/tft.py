@@ -3,10 +3,9 @@ import os
 import warnings
 import logging
 import wandb
-from wandb.keras import WandbMetricsLogger, WandbModelCheckpoint
 
 warnings.filterwarnings("ignore")
-wandb.init(project='t1d_tft')
+wandb.init(entity = 't1d_uofa', project='t1d_tft')
 
 import numpy as np
 import pandas as pd
@@ -21,6 +20,8 @@ from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 from lightning.pytorch.tuner import Tuner
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.fabric.utilities.rank_zero import rank_zero_info
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import WandbLogger
 
 from pytorch_forecasting import Baseline, TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer
@@ -83,41 +84,67 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     val_dataloader = validation.to_dataloader(train=False, batch_size=320, num_workers = 0)
 # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-    # configure network and trainer
-    early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
-    logger = TensorBoardLogger(save_dir="./data/normal/predictions/tft",)
+    hparams = {
+        "learning_rate": 0.011876282198155926,
+        "hidden_size": 126,
+        "attention_head_size": 3,
+        "dropout": 0.2714312556856915,
+        "hidden_continuous_size": 34,
+        "batch_size": 32,
+        "gradient_clip_val": 0.041158135741519074,
+        "optimizer": "Adam",
+        "reduce_on_plateau_patience": 4
+    }
 
+
+    #WandB logger:
+    wandb_logger = WandbLogger(log_model="all", project="t1d_tft")
+    wandb_logger.log_hyperparams(hparams)
+
+    #Callbacks
+    early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
+    lr_logger = LearningRateMonitor()  # log the learning rate
+    tensorboard_logger = TensorBoardLogger(save_dir="./data/normal/predictions/tft")
+    checkpoint_callback = ModelCheckpoint(dirpath="./data/normal/predictions/tft/checkpoints",
+                                        filename="best_model",
+                                        save_top_k=1,
+                                        monitor="val_loss",
+                                        mode="min",
+    )
+
+    #Trainer
     trainer = pl.Trainer(
         max_epochs=10,
         accelerator="gpu",
         enable_model_summary=True,
-        gradient_clip_val=0.041158135741519074,
+        gradient_clip_val=hparams["gradient_clip_val"],
         # limit_train_batches=50,
-        callbacks=[WandbMetricsLogger(log_freq=5), WandbModelCheckpoint("models")],
-        logger=logger
-)
+        callbacks=[lr_logger, early_stop_callback, checkpoint_callback],
+        logger=[wandb_logger, tensorboard_logger]
+    )
 
+    #TFT model
     tft = TemporalFusionTransformer.from_dataset(
         training,
-        learning_rate=0.011876282198155926,
-        hidden_size=126,
-        attention_head_size=3,
-        dropout=0.2714312556856915,
-        hidden_continuous_size=34,
+        learning_rate=hparams["learning_rate"],
+        hidden_size=hparams["hidden_size"],
+        attention_head_size=hparams["attention_head_size"],
+        dropout=hparams["dropout"],
+        hidden_continuous_size=hparams["hidden_continuous_size"],
         loss=MAE(),
         log_interval=10,
-        optimizer="Adam",
-        reduce_on_plateau_patience=4,
+        optimizer=hparams["optimizer"],
+        reduce_on_plateau_patience=hparams["reduce_on_plateau_patience"],
     )
     print(f"Number of parameters in network: {tft.size()/1e3:.1f}k")
 
-    # fit network
-
-    trainer.fit(
-        tft,
-        train_dataloaders=train_dataloader,
-        val_dataloaders=val_dataloader
-    )
+    #Fit network
+    try:
+        trainer.fit(tft, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
+    except Exception as e:
+        wandb_logger.finalize(status="failed")  # Explicitly pass the status argument
+        wandb.finish()  # Properly close WandB session
+        raise e  # Reraise exception for debuggi
 
     # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
     # # Tuning Hyperparameters
@@ -214,6 +241,7 @@ metrics = {
     't_MARD': f'{t_MARD[0]/N_SPLIT} +- {t_MARD[1]/N_SPLIT}',
     't_gMARD': f'{t_gMARD[0]/N_SPLIT} +- {t_gMARD[1]/N_SPLIT}'
 }
+wandb.log(metrics)
 
 metrics_df = pd.DataFrame(metrics,index=[0])
 metrics_df.to_csv('./data/normal/predictions/tft/metrics.csv', index=False)

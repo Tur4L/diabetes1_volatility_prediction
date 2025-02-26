@@ -1,6 +1,12 @@
 # Lightning logs
 lightning_logs/
 
+# wandb
+wandb/
+
+# Checkpoints
+checkpoints/
+
 # Scripts
 batch_scripts/
 
