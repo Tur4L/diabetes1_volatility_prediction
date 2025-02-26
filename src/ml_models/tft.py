@@ -2,8 +2,11 @@ import sys
 import os
 import warnings
 import logging
+import wandb
+from wandb.keras import WandbMetricsLogger, WandbModelCheckpoint
 
 warnings.filterwarnings("ignore")
+wandb.init(project='t1d_tft')
 
 import numpy as np
 import pandas as pd
@@ -82,7 +85,6 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
 
     # configure network and trainer
     early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
-    lr_logger = LearningRateMonitor()  # log the learning rate
     logger = TensorBoardLogger(save_dir="./data/normal/predictions/tft",)
 
     trainer = pl.Trainer(
@@ -91,7 +93,7 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
         enable_model_summary=True,
         gradient_clip_val=0.041158135741519074,
         # limit_train_batches=50,
-        callbacks=[lr_logger, early_stop_callback],
+        callbacks=[WandbMetricsLogger(log_freq=5), WandbModelCheckpoint("models")],
         logger=logger
 )
 
@@ -110,6 +112,7 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     print(f"Number of parameters in network: {tft.size()/1e3:.1f}k")
 
     # fit network
+
     trainer.fit(
         tft,
         train_dataloaders=train_dataloader,

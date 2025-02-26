@@ -1,7 +1,10 @@
 # Lightning logs
 lightning_logs/
 
-#LSTM logs
+# Scripts
+batch_scripts/
+
+# LSTM logs
 lstm_logs
 
 # Byte-compiled / optimized / DLL files
