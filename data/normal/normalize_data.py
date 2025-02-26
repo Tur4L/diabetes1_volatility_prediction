@@ -2,6 +2,9 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import random
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 
 scaler = MinMaxScaler()
 def create_cgm_data():
@@ -104,7 +107,7 @@ def create_screening_data():
 
     #No need for ParentLoginVisitID; Visit is Baseline; InclCritMet and ExclCritAbsent is checked for all. Missing worktype for almost half of the patients.
     db_screening.drop(['ParentLoginVisitID', 'Visit', 'InclCritMet', 'ExclCritAbsent', 'RecID',
-                       'HbA1cTestDtDaysFromEnroll', 'WorkType','Ethnicity','Race',
+                       'HbA1cTestDtDaysFromEnroll', 'WorkType','Ethnicity',
                        'LastMenstCycStartDtDaysFromEnroll','LastMenstCycStartDtUnk',
                        'LastMenstCycStartDtNA','LastMenstCycEndDtDaysFromEnroll','LastMenstCycEndDtUnk',
                        'LastMenstCycEndDtNA'], axis=1, inplace=True)
@@ -121,13 +124,7 @@ def create_age_data():
 
     db_age = pd.read_csv(db_path)
     db_age.drop_duplicates(['RecID', 'PtID'], inplace=True)
-    db_age.drop(['RecID','SiteID','PtStatus'], axis=1, inplace=True)
-
-    db_less_18 = db_age[db_age['AgeAsOfEnrollDt'] < 18]
-    db_18_and_over = db_age[db_age['AgeAsOfEnrollDt'] >=18]
-
-    print(f'Number of less than 18 years olds: {db_less_18['AgeAsOfEnrollDt'].size}')
-    print(f'Number of 18 years olds and over: {db_18_and_over['AgeAsOfEnrollDt'].size}')
+    db_age.drop(['RecID','SiteID'], axis=1, inplace=True)
 
     db_age.to_csv('./data/normal/db_age.csv')
     return db_age
@@ -139,6 +136,36 @@ def seperate_for_ages(db):
 
     return less_than_18, greater_than_18, between_12_and_18
 
+def data_info(db_age, db_screening, db_medication, db_precondition):
+
+    num_people = db_age['PtID'].size
+    num_dropped = db_age[db_age['PtStatus'] == 'Dropped'].shape[0]
+    num_completed = num_people - num_dropped
+
+    num_male = db_screening[db_screening['Gender'] == 0].shape[0]
+    num_female = db_screening[db_screening['Gender'] == 1].shape[0]
+    num_races = db_screening['Race'].value_counts()
+
+    min_age = db_age['AgeAsOfEnrollDt'].min()
+    max_age = db_age['AgeAsOfEnrollDt'].max()
+    num_less_than_18 = db_age[db_age['AgeAsOfEnrollDt'] < 18].shape[0]
+    num_18_or_older = db_age[db_age['AgeAsOfEnrollDt'] >= 18].shape[0]
+
+    print('JAEB data info:\n')
+    print(f'\tNumber of patients: {num_people}')
+    print(f'\tNumber of completed patients : {num_completed}')
+    print()
+    print(f'\tNumber of male: {num_male}')
+    print(f'\tNumber of female: {num_female}')
+    print()
+    print(f'\tMinimum age: {min_age}')
+    print(f'\tMaximum age age: {max_age}')
+    print(f'\tNumber of less than 18 years olds: {num_less_than_18}')
+    print(f'\tNumber of 18 or older years olds: {num_18_or_older}')
+    print()
+    print('\tRace division:')
+    print(num_races)
+
 def main():
     db_cgm = create_cgm_data()
     db_medication = create_medication_data()
@@ -147,15 +174,21 @@ def main():
     db_screening = create_screening_data()
     db_age = create_age_data()
 
+    data_info(db_age, db_screening, db_medication, db_precondition)
+
+    db_screening.drop(['Race'], axis=1, inplace=True)
+    db_age = db_age[db_age['PtStatus'] == 'Completed']
+    db_age.drop(['PtStatus'], axis=1, inplace=True)
+
     db_final = pd.merge(db_cgm, db_age, on='PtID', how='inner')
     db_final = pd.merge(db_final, db_screening, on='PtID', how='inner')
     less_than_18, greater_than_18, between_12_and_18 = seperate_for_ages(db_final)
 
     columns_to_scale = ['DeviceTm','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
-    db_final[columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
-    less_than_18[columns_to_scale] = scaler.fit_transform(less_than_18[columns_to_scale])
-    greater_than_18[columns_to_scale] = scaler.fit_transform(greater_than_18[columns_to_scale])
-    between_12_and_18[columns_to_scale] = scaler.fit_transform(between_12_and_18[columns_to_scale])
+    db_final.loc[:, columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
+    less_than_18.loc[:, columns_to_scale] = scaler.fit_transform(less_than_18[columns_to_scale])
+    greater_than_18.loc[:, columns_to_scale] = scaler.fit_transform(greater_than_18[columns_to_scale])
+    between_12_and_18.loc[:, columns_to_scale] = scaler.fit_transform(between_12_and_18[columns_to_scale])
 
     db_final.to_csv('./data/normal/db_final.csv',index=False)
     less_than_18.to_csv('./data/normal/db_age_less_than_18.csv', index=False)
