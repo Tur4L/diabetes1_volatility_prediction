@@ -1,7 +1,19 @@
 # Lightning logs
 lightning_logs/
 
-#LSTM logs
+# Data stuff
+original/
+
+# wandb
+wandb/
+
+# Checkpoints
+checkpoints/
+
+# Scripts
+batch_scripts/
+
+# LSTM logs
 lstm_logs
 
 # Byte-compiled / optimized / DLL files
