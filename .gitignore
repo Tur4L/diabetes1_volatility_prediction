@@ -1,6 +1,9 @@
 # Lightning logs
 lightning_logs/
 
+# Data stuff
+original/
+
 # wandb
 wandb/
 
