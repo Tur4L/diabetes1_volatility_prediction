@@ -20,15 +20,53 @@ def match_cgm_aljc(df_cgm: pd.DataFrame, df_aljc: pd.DataFrame) -> pd.DataFrame:
     df_aljc = clean_aljc(df_aljc)
 
     df_final = pd.merge(df_cgm, df_aljc, on=['id','visit'], how='inner')
+    df_final.loc[:,'timestamp'] = pd.to_datetime(df_final['timestamp'], format = "%Y-%m-%d %H:%M:%S", errors ='coerce')
+    df_final.sort_values(by=['id','visit','timestamp'], ascending=True, inplace=True)
     df_final.to_csv('./data/diagnode/df_final.csv', index=False)
 
     return df_final
+
+def data_info(df_aljc, df_cgm):
+
+    no_dup_df = df_aljc.drop_duplicates(subset='id')
+
+    num_people = no_dub_df.shape[0]
+    num_total_visits = df_aljc.shape[0]
+
+    num_male = no_dub_df[no_dub_df['sex'] == 'Male'].shape[0]
+    num_female = no_dub_df[no_dub_df['sex'] == 'Female'].shape[0]
+    # num_races = db_screening['Race'].value_counts()
+
+    min_age = no_dub_df['age'].min()
+    max_age = no_dub_df['age'].max()
+    num_less_than_18 = no_dub_df[no_dub_df['age'] < 18].shape[0]
+    num_18_or_older = no_dub_df[no_dub_df['age'] >= 18].shape[0]
+
+    print('Diagnode data info:\n')
+    print(f'Number of patients: {num_people}')
+    print(f'Number of total visits: {num_total_visits}')
+    print()
+    print(f'Number of male: {num_male}')
+    print(f'Number of female: {num_female}')
+    print()
+    print(f'Minimum age: {min_age}')
+    print(f'Maximum age age: {max_age}')
+    print(f'Number of less than 18 years olds: {num_less_than_18}')
+    print(f'Number of 18 or older years olds: {num_18_or_older}')
+    print()
+    print('C-Peptide availability: Yes\nC-Peptide interval: 30 minutes')
+    print('Beta2 score availability: Yes\nBeta2 score interval:0-6-15-24 months')
+    print('CGM availability: Yes\nCGM device: Maybe FreeStyle Libre\nCGM interval: 15 minutes')
+    # print('\n\tRace division:')
+    # print(num_races)
+
  
 def main():
     df_cgm = pd.read_csv('./data/diagnode/original/CGM_RANDOMISED_preprocessed.csv')
     df_aljc = pd.read_csv('./data/diagnode/original/ALJC_clean_DIAGNODE_analysis_dataset_perch.csv')
 
     df_final = match_cgm_aljc(df_cgm, df_aljc)
+    data_info(df_aljc, df_cgm)
 
     return df_final
 

@@ -183,10 +183,6 @@ def lstm_data(db_cgm, db_beta, db_transplants):
     db_final['DeviceTm'] = db_final.groupby('PtID')['DeviceTm'].transform(
         lambda x: (x-x.min()).dt.total_seconds())
 
-    #Scaling
-    columns_to_scale = ['DeviceTm','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
-    db_final[columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
-    db_final.to_csv('./data/type_1/db_final.csv', index=False)
     return db_final
     
 def match_cgm_beta2(db_full, db_beta, db_transplant):
@@ -351,27 +347,48 @@ def window_3days(selected_window, end_date):
 
     return sub_window
 
-if __name__ == "__main__":
+def data_info(db_final):
+
+    no_dup_df = db_final.drop_duplicates(subset='PtID')
+
+    num_people = no_dup_df['PtID'].size
+
+    num_male = no_dup_df[no_dup_df['Gender'] == 0].shape[0]
+    num_female = no_dup_df[no_dup_df['Gender'] == 1].shape[0]
+
+    min_age = no_dup_df['AgeAsOfEnrollDt'].min()
+    max_age = no_dup_df['AgeAsOfEnrollDt'].max()
+    num_less_than_18 = no_dup_df[no_dup_df['AgeAsOfEnrollDt'] < 18].shape[0]
+    num_18_or_older = no_dup_df[no_dup_df['AgeAsOfEnrollDt'] >= 18].shape[0]
+
+    print('Islet transplant data info:\n')
+    print(f'Number of patients: {num_people}')
+    print()
+    print(f'Number of male: {num_male}')
+    print(f'Number of female: {num_female}')
+    print()
+    print(f'Minimum age: {min_age}')
+    print(f'Maximum age age: {max_age}')
+    print(f'Number of less than 18 years olds: {num_less_than_18}')
+    print(f'Number of 18 or older years olds: {num_18_or_older}')
+    print()
+    print('C-Peptide availability: No\nC-Peptide interval: N/A')
+    print('Beta function availability: Yes\nBeta function interval: Inconsistent ')
+    print('CGM availability: Yes\nCGM device: Dexcom and FreeStyle Libre\nCGM interval: 5 and 15 minutes respectively')
+
+def main():
     full_db, full_db_beta, full_db_transplant = create_dbs()
     db_final = lstm_data(full_db, full_db_beta.drop(['timestamp','is_relevant'], axis=1), full_db_transplant)
-    full_db.to_csv('./data/type_1/db_full.csv', index=False)
-    windowed_db = match_cgm_beta2(full_db, full_db_beta, full_db_transplant)
-    patient_windowed_db = patient_beta2_windows(windowed_db,4)
+    data_info(db_final)
+
+    columns_to_scale = ['DeviceTm','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
+    db_final[columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
+    db_final.to_csv('./data/type_1/db_final.csv', index=False)
+
+
+    # windowed_db = match_cgm_beta2(full_db, full_db_beta, full_db_transplant)
+    # patient_windowed_db = patient_beta2_windows(windowed_db,4)
  
-    # grouped_full_db = full_db.groupby('patient_id')
-    # all_patients_data = []
-    # for patient_id, patient_data in grouped_full_db:
-    # # Filter the Beta2 data for the current patient
-    #     beta2_patient_data = full_db_beta[full_db_beta['patient_id'] == patient_id]
 
-    # # Interpolate and merge the Beta2 scores with CGM data for this patient
-    #     merged_df = interpolate_data(patient_data.copy(), beta2_patient_data.copy())
-    
-    # # Append the result to the final list
-    #     all_patients_data.append(merged_df)
-
-    # # Step 3: Combine all patients' data into a single DataFrame
-    # full_db = pd.concat(all_patients_data, ignore_index=True)
-    # full_db = full_db.drop('date_only', axis = 1)
-
-    # full_db.to_csv("./data/normalized_JS_JT_KB.csv", index=False)
+if __name__ == "__main__":
+    main()
