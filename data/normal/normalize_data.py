@@ -22,12 +22,12 @@ def create_cgm_data():
     df_cgm['time_diff'] = df_cgm.groupby('PtID')['DeviceTm_seconds'].diff()
     df_cons_intervals = df_cgm[(df_cgm['time_diff'] < 930) & (df_cgm['time_diff']>870)]
 
-    const_ratio = df_cons_intervals.shape[0]/df_cgm.shape[0]
-    print(const_ratio)
+    # const_ratio = df_cons_intervals.shape[0]/df_cgm.shape[0]
+    # print(const_ratio)
 
-    # df_cgm['Scaled_Value'] = df_cgm['Value']
+    df_cgm['Scaled_Value'] = df_cgm['Value']
 
-    df_cgm.drop(['RecordType', 'time_diff', 'DeviceTm_seconds'], axis=1, inplace=True)
+    df_cgm.drop(['RecordType', 'time_diff'], axis=1, inplace=True)
 
     df_cgm.to_csv('./data/normal/df_cgm.csv', index=False)
     return df_cgm
@@ -37,12 +37,12 @@ def create_medication_data():
     Creates medication database
     '''
 
-    db_path = './data/normal/original/NonDiabMedication.csv'
-    db_medication = pd.read_csv(db_path)
-    db_medication.drop_duplicates(['RecID', 'PtID'], inplace=True)
+    df_path = './data/normal/original/NonDiabMedication.csv'
+    df_medication = pd.read_csv(df_path)
+    df_medication.drop_duplicates(['RecID', 'PtID'], inplace=True)
 
     #No unknow dose; Only oral route; No eye or ear treatments; No medical conditions; No adverse events; No treatment started after enrollment;
-    db_medication.drop(['MedDoseUnk', 'MedRoute', 'MedLocSide', 'MedicalCondition1', 'AdverseEvent1',
+    df_medication.drop(['MedDoseUnk', 'MedRoute', 'MedLocSide', 'MedicalCondition1', 'AdverseEvent1',
                         'MedStartDaysFromEnroll', 'MedStartDtApprox', 'MedStopDaysFromEnroll', 'MedStopDtApprox',
                         'MedStartMonthsAfterEnroll', 'MedStartYearsAfterEnroll', 'MedStopMonthsAfterEnroll',
                         'MedStopYearsAfterEnroll', 'MedStartDtUnk', 'MedCondNotReqd', 'MedCondNotReqd',
@@ -50,114 +50,114 @@ def create_medication_data():
                         'MedStartTrtCat', 'MedFreqUnk', 'PreExistCondNotReqd', 'MedStopDtUnk'], axis=1, inplace=True) 
 
     #PtID 7 takes medication only for prevention
-    db_medication.loc[db_medication['PtID'] == 7, 'MedFreqNum'] = 0
-    db_medication.loc[db_medication['PtID'] == 7, 'MedFreqPer'] = 'N/A'
+    df_medication.loc[df_medication['PtID'] == 7, 'MedFreqNum'] = 0
+    df_medication.loc[df_medication['PtID'] == 7, 'MedFreqPer'] = 'N/A'
 
     #PtID 38 has unknown end date of medication
-    db_medication.loc[db_medication['PtID'] == 38, 'MedOngoing'] = 0
+    df_medication.loc[df_medication['PtID'] == 38, 'MedOngoing'] = 0
 
 
     ''' Medication encoding'''
-    # db_medication['Medication_Num'] = db_medication.groupby('PtID').cumcount() + 1
-    # db_medication = db_medication.pivot(index='PtID',columns='Medication_Num', values=['MedDose','MedUnit','MedFreqType','MedFreqNum','MedFreqPer','MedInd','MedOngoing','PreExistingCondition1','DrugName'])
-    # db_medication.columns = [f'{col[0]}_{col[1]}' for col in db_medication.columns]
-    # db_medication.reset_index(inplace=True)
+    # df_medication['Medication_Num'] = df_medication.groupby('PtID').cumcount() + 1
+    # df_medication = df_medication.pivot(index='PtID',columns='Medication_Num', values=['MedDose','MedUnit','MedFreqType','MedFreqNum','MedFreqPer','MedInd','MedOngoing','PreExistingCondition1','DrugName'])
+    # df_medication.columns = [f'{col[0]}_{col[1]}' for col in df_medication.columns]
+    # df_medication.reset_index(inplace=True)
 
-    # medications_combined = db_medication[['DrugName_1', 'DrugName_2', 'DrugName_3', 'DrugName_4']].apply(lambda x: ','.join(x.dropna()), axis=1)
+    # medications_combined = df_medication[['DrugName_1', 'DrugName_2', 'DrugName_3', 'DrugName_4']].apply(lambda x: ','.join(x.dropna()), axis=1)
     # df_medications = pd.DataFrame(medications_combined.str.get_dummies(sep=','))
-    # db_medication = pd.concat([db_medication[['PtID']], df_medications], axis=1)
+    # df_medication = pd.concat([df_medication[['PtID']], df_medications], axis=1)
 
-    # db_medication = pd.get_dummies(db_medication, columns=['MedUnit','MedFreqType','MedFreqPer','MedInd','PreExistingCondition1','DrugName'])
+    # df_medication = pd.get_dummies(df_medication, columns=['MedUnit','MedFreqType','MedFreqPer','MedInd','PreExistingCondition1','DrugName'])
 
-    db_medication.to_csv('./data/normal/db_medication.csv', index=False)
-    return db_medication
+    # df_medication.to_csv('./data/normal/df_medication.csv', index=False)
+    return df_medication
 
 def create_logs_data():
     '''
     Creates participant logs database
     '''
 
-    db_path = './data/normal/original/NonDiabParticipantLogs.csv'
-    db_logs = pd.read_csv(db_path)
-    db_logs.drop_duplicates(['RecID', 'PtID'], inplace=True)
-    db_logs.drop(['RecID'], axis=1, inplace=True)
+    df_path = './data/normal/original/NonDiabParticipantLogs.csv'
+    df_logs = pd.read_csv(df_path)
+    df_logs.drop_duplicates(['RecID', 'PtID'], inplace=True)
+    df_logs.drop(['RecID'], axis=1, inplace=True)
 
-    db_logs.to_csv('./data/normal/db_logs.csv', index=False)
-    return db_logs
+    # df_logs.to_csv('./data/normal/db_logs.csv', index=False)
+    return df_logs
 
 def create_pre_conditions_data():
     '''
     Creates pre-existing conditions database
     '''
 
-    db_path = './data/normal/original/NonDiabPreExistingCondition.csv'
-    db_preconditions = pd.read_csv(db_path)
-    db_preconditions.drop_duplicates(['RecID', 'PtID'])
+    df_path = './data/normal/original/NonDiabPreExistingCondition.csv'
+    df_preconditions = pd.read_csv(df_path)
+    df_preconditions.drop_duplicates(['RecID', 'PtID'])
 
     #No Medical Condition Status; No Recovery date; No approximation
-    db_preconditions.drop(['MedCondStatus', 'MedCondResDtDaysFromEnroll', 'MedCondResDtApprox', 'RecID'], axis=1, inplace=True)
-    db_preconditions = db_preconditions[~db_preconditions['PtID'].isin([14, 164])] #no CGM data available for ptid 14, 164.
+    df_preconditions.drop(['MedCondStatus', 'MedCondResDtDaysFromEnroll', 'MedCondResDtApprox', 'RecID'], axis=1, inplace=True)
+    df_preconditions = df_preconditions[~df_preconditions['PtID'].isin([14, 164])] #no CGM data available for ptid 14, 164.
     
-    # db_preconditions = pd.get_dummies(db_preconditions, columns=['MedicalCondition','PreExistDuration'])
-    # db_preconditions['PreExistMedCurr'] = db_preconditions['PreExistMedCurr'].map({'Yes' : 1, 'No': 0})
+    # df_preconditions = pd.get_dummies(df_preconditions, columns=['MedicalCondition','PreExistDuration'])
+    # df_preconditions['PreExistMedCurr'] = df_preconditions['PreExistMedCurr'].map({'Yes' : 1, 'No': 0})
 
-    db_preconditions.to_csv('./data/normal/db_precondition.csv', index= False)
-    return db_preconditions
+    # df_preconditions.to_csv('./data/normal/df_precondition.csv', index= False)
+    return df_preconditions
 
 def create_screening_data():
     '''
     Creates screening database
     '''
 
-    db_path = './data/normal/original/NonDiabScreening.csv'
-    db_screening = pd.read_csv(db_path)
-    db_screening.drop_duplicates(['RecID', 'PtID'], inplace=True)
+    df_path = './data/normal/original/NonDiabScreening.csv'
+    df_screening = pd.read_csv(df_path)
+    df_screening.drop_duplicates(['RecID', 'PtID'], inplace=True)
 
     #No need for ParentLoginVisitID; Visit is Baseline; InclCritMet and ExclCritAbsent is checked for all. Missing worktype for almost half of the patients.
-    db_screening.drop(['ParentLoginVisitID', 'Visit', 'InclCritMet', 'ExclCritAbsent', 'RecID',
+    df_screening.drop(['ParentLoginVisitID', 'Visit', 'InclCritMet', 'ExclCritAbsent', 'RecID',
                        'HbA1cTestDtDaysFromEnroll', 'WorkType','Ethnicity',
                        'LastMenstCycStartDtDaysFromEnroll','LastMenstCycStartDtUnk',
                        'LastMenstCycStartDtNA','LastMenstCycEndDtDaysFromEnroll','LastMenstCycEndDtUnk',
                        'LastMenstCycEndDtNA'], axis=1, inplace=True)
     
-    db_screening['Gender'] = db_screening['Gender'].map({'M' : 0, 'F': 1})
-    db_screening['T1DBioFamily'] = db_screening['T1DBioFamily'].map({'No' : 0, 'Yes': 1})
-    db_screening[['T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk']] = db_screening[['T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk']].fillna(0)
+    df_screening['Gender'] = df_screening['Gender'].map({'M' : 0, 'F': 1})
+    df_screening['T1DBioFamily'] = df_screening['T1DBioFamily'].map({'No' : 0, 'Yes': 1})
+    df_screening[['T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk']] = df_screening[['T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk']].fillna(0)
 
-    db_screening.to_csv('./data/normal/db_screening.csv', index=False)
-    return db_screening
+    # df_screening.to_csv('./data/normal/df_screening.csv', index=False)
+    return df_screening
 
 def create_age_data():
-    db_path = './data/normal/original/NonDiabPtRoster.csv'
+    df_path = './data/normal/original/NonDiabPtRoster.csv'
 
-    db_age = pd.read_csv(db_path)
-    db_age.drop_duplicates(['RecID', 'PtID'], inplace=True)
-    db_age.drop(['RecID','SiteID'], axis=1, inplace=True)
+    df_age = pd.read_csv(df_path)
+    df_age.drop_duplicates(['RecID', 'PtID'], inplace=True)
+    df_age.drop(['RecID','SiteID'], axis=1, inplace=True)
 
-    db_age.to_csv('./data/normal/db_age.csv')
-    return db_age
+    # df_age.to_csv('./data/normal/df_age.csv')
+    return df_age
 
-def seperate_for_ages(db):
-    less_than_18 = db[db['AgeAsOfEnrollDt'] < 18]
-    greater_than_18 = db[db['AgeAsOfEnrollDt'] > 18]
-    between_12_and_18 = db[(db['AgeAsOfEnrollDt'] < 18) & (db['AgeAsOfEnrollDt'] >= 12)]
+def seperate_for_ages(df):
+    less_than_18 = df[df['AgeAsOfEnrollDt'] < 18]
+    greater_than_18 = df[df['AgeAsOfEnrollDt'] > 18]
+    between_12_and_18 = df[(df['AgeAsOfEnrollDt'] < 18) & (df['AgeAsOfEnrollDt'] >= 12)]
 
     return less_than_18, greater_than_18, between_12_and_18
 
-def data_info(db_age, db_screening, db_medication, db_precondition):
+def data_info(df_age, df_screening, df_medication, df_precondition):
 
-    num_people = db_age['PtID'].size
-    num_dropped = db_age[db_age['PtStatus'] == 'Dropped'].shape[0]
+    num_people = df_age['PtID'].size
+    num_dropped = df_age[df_age['PtStatus'] == 'Dropped'].shape[0]
     num_completed = num_people - num_dropped
 
-    num_male = db_screening[db_screening['Gender'] == 0].shape[0]
-    num_female = db_screening[db_screening['Gender'] == 1].shape[0]
-    num_races = db_screening['Race'].value_counts()
+    num_male = df_screening[df_screening['Gender'] == 0].shape[0]
+    num_female = df_screening[df_screening['Gender'] == 1].shape[0]
+    num_races = df_screening['Race'].value_counts()
 
-    min_age = db_age['AgeAsOfEnrollDt'].min()
-    max_age = db_age['AgeAsOfEnrollDt'].max()
-    num_less_than_18 = db_age[db_age['AgeAsOfEnrollDt'] < 18].shape[0]
-    num_18_or_older = db_age[db_age['AgeAsOfEnrollDt'] >= 18].shape[0]
+    min_age = df_age['AgeAsOfEnrollDt'].min()
+    max_age = df_age['AgeAsOfEnrollDt'].max()
+    num_less_than_18 = df_age[df_age['AgeAsOfEnrollDt'] < 18].shape[0]
+    num_18_or_older = df_age[df_age['AgeAsOfEnrollDt'] >= 18].shape[0]
 
     print('JAEB data info:\n')
     print(f'Number of patients: {num_people}')
@@ -178,35 +178,35 @@ def data_info(db_age, db_screening, db_medication, db_precondition):
     print(num_races)
 
 def main():
-    db_cgm = create_cgm_data()
-    db_medication = create_medication_data()
-    db_logs = create_logs_data()
-    db_precondition = create_pre_conditions_data()
-    db_screening = create_screening_data()
-    db_age = create_age_data()
+    df_cgm = create_cgm_data()
+    df_medication = create_medication_data()
+    df_logs = create_logs_data()
+    df_precondition = create_pre_conditions_data()
+    df_screening = create_screening_data()
+    df_age = create_age_data()
 
-    data_info(db_age, db_screening, db_medication, db_precondition)
+    data_info(df_age, df_screening, df_medication, df_precondition)
 
-    db_screening.drop(['Race'], axis=1, inplace=True)
-    db_age = db_age[db_age['PtStatus'] == 'Completed']
-    db_age.drop(['PtStatus'], axis=1, inplace=True)
+    df_screening.drop(['Race'], axis=1, inplace=True)
+    df_age = df_age[df_age['PtStatus'] == 'Completed']
+    df_age.drop(['PtStatus'], axis=1, inplace=True)
 
-    db_final = pd.merge(db_cgm, db_age, on='PtID', how='inner')
-    db_final = pd.merge(db_final, db_screening, on='PtID', how='inner')
-    less_than_18, greater_than_18, between_12_and_18 = seperate_for_ages(db_final)
+    df_final = pd.merge(df_cgm, df_age, on='PtID', how='inner')
+    df_final = pd.merge(df_final, df_screening, on='PtID', how='inner')
+    less_than_18, greater_than_18, between_12_and_18 = seperate_for_ages(df_final)
 
-    columns_to_scale = ['DeviceTm','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
-    # db_final.loc[:, columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
-    # less_than_18.loc[:, columns_to_scale] = scaler.fit_transform(less_than_18[columns_to_scale])
-    # greater_than_18.loc[:, columns_to_scale] = scaler.fit_transform(greater_than_18[columns_to_scale])
-    # between_12_and_18.loc[:, columns_to_scale] = scaler.fit_transform(between_12_and_18[columns_to_scale])
+    columns_to_scale = ['DeviceTm_seconds','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
+    df_final.loc[:, columns_to_scale] = scaler.fit_transform(df_final[columns_to_scale])
+    less_than_18.loc[:, columns_to_scale] = scaler.fit_transform(less_than_18[columns_to_scale])
+    greater_than_18.loc[:, columns_to_scale] = scaler.fit_transform(greater_than_18[columns_to_scale])
+    between_12_and_18.loc[:, columns_to_scale] = scaler.fit_transform(between_12_and_18[columns_to_scale])
 
-    db_final.to_csv('./data/normal/df_final.csv',index=False)
-    less_than_18.to_csv('./data/normal/db_age_less_than_18.csv', index=False)
-    greater_than_18.to_csv('./data/normal/db_age_greater_than_18.csv',index=False)
-    between_12_and_18.to_csv('./data/normal/db_age_between_12_and_18.csv',index=False)
+    df_final.to_csv('./data/normal/df_final.csv',index=False)
+    # less_than_18.to_csv('./data/normal/df_age_less_than_18.csv', index=False)
+    # greater_than_18.to_csv('./data/normal/df_age_greater_than_18.csv',index=False)
+    # between_12_and_18.to_csv('./data/normal/df_age_between_12_and_18.csv',index=False)
 
-    return db_final
+    return df_final
 
 if __name__ == '__main__':
     main()

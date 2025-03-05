@@ -3,19 +3,6 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import random
 
-'''
-Overlapping features:
-    id
-    timestamp/DeviceTM
-    Value
-    Age/AgeAsOfEnrollDt
-    Weight
-    Height
-    Sex
-    hbA1C
-
-'''
-
 def clean_aljc(df_aljc: pd.DataFrame) -> pd.DataFrame:
     df_aljc = df_aljc[['id','visit','treatment','sex','weight','height','age','hb_a1c',
                        'c_peptide_fasting','glucose_fasting']]
@@ -25,6 +12,11 @@ def clean_cgm(df_cgm: pd.DataFrame) -> pd.DataFrame:
     df_cgm[['id','visit','device_id']] = df_cgm['ID_VISIT_DEVICEID'].str.split('_',expand=True)
     df_cgm = df_cgm[['id','visit','TIMESTAMP','GLUCOSE']]
     df_cgm.rename(columns={'TIMESTAMP': 'timestamp', 'GLUCOSE': 'glucose mmol/l'}, inplace=True)
+    df_cgm['timestamp'] = pd.to_datetime(df_cgm['timestamp'], format = "%Y-%m-%d %H:%M:%S", errors ='coerce')
+    df_cgm.loc[:,'timestamp'] = df_cgm.groupby('id')['timestamp'].transform(
+        lambda x: (x-x.min()).dt.total_seconds())
+
+    df_cgm.to_csv('./data/diagnode/df_cgm.csv')
 
     return df_cgm
 
@@ -33,8 +25,6 @@ def match_cgm_aljc(df_cgm: pd.DataFrame, df_aljc: pd.DataFrame) -> pd.DataFrame:
     df_aljc = clean_aljc(df_aljc)
 
     df_final = pd.merge(df_cgm, df_aljc, on=['id','visit'], how='inner')
-    df_final.loc[:,'timestamp'] = pd.to_datetime(df_final['timestamp'], format = "%Y-%m-%d %H:%M:%S", errors ='coerce')
-    df_final.sort_values(by=['id','visit','timestamp'], ascending=True, inplace=True)
     df_final.to_csv('./data/diagnode/df_final.csv', index=False)
 
     return df_final
@@ -43,17 +33,17 @@ def data_info(df_aljc, df_cgm):
 
     no_dup_df = df_aljc.drop_duplicates(subset='id')
 
-    num_people = no_dub_df.shape[0]
+    num_people = no_dup_df.shape[0]
     num_total_visits = df_aljc.shape[0]
 
-    num_male = no_dub_df[no_dub_df['sex'] == 'Male'].shape[0]
-    num_female = no_dub_df[no_dub_df['sex'] == 'Female'].shape[0]
+    num_male = no_dup_df[no_dup_df['sex'] == 'Male'].shape[0]
+    num_female = no_dup_df[no_dup_df['sex'] == 'Female'].shape[0]
     # num_races = db_screening['Race'].value_counts()
 
-    min_age = no_dub_df['age'].min()
-    max_age = no_dub_df['age'].max()
-    num_less_than_18 = no_dub_df[no_dub_df['age'] < 18].shape[0]
-    num_18_or_older = no_dub_df[no_dub_df['age'] >= 18].shape[0]
+    min_age = no_dup_df['age'].min()
+    max_age = no_dup_df['age'].max()
+    num_less_than_18 = no_dup_df[no_dup_df['age'] < 18].shape[0]
+    num_18_or_older = no_dup_df[no_dup_df['age'] >= 18].shape[0]
 
     print('Diagnode data info:\n')
     print(f'Number of patients: {num_people}')
