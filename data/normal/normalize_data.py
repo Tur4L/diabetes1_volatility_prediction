@@ -25,8 +25,6 @@ def create_cgm_data():
     # const_ratio = df_cons_intervals.shape[0]/df_cgm.shape[0]
     # print(const_ratio)
 
-    df_cgm['Scaled_Value'] = df_cgm['Value']
-
     df_cgm.drop(['RecordType', 'time_diff'], axis=1, inplace=True)
 
     df_cgm.to_csv('./data/normal/df_cgm.csv', index=False)
@@ -193,6 +191,8 @@ def main():
 
     df_final = pd.merge(df_cgm, df_age, on='PtID', how='inner')
     df_final = pd.merge(df_final, df_screening, on='PtID', how='inner')
+    df_final['Scaled_Value'] = df_cgm['Value']
+    
     less_than_18, greater_than_18, between_12_and_18 = seperate_for_ages(df_final)
 
     columns_to_scale = ['DeviceTm_seconds','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
