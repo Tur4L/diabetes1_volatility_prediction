@@ -379,7 +379,7 @@ def data_info(db_final):
 def main():
     full_db, full_db_beta, full_db_transplant = create_dbs()
     df_final = lstm_data(full_db, full_db_beta.drop(['timestamp','is_relevant'], axis=1), full_db_transplant)
-    data_info(db_final)
+    data_info(df_final)
 
     columns_to_scale = ['DeviceTm','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
     df_final[columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])

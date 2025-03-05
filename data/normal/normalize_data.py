@@ -201,7 +201,7 @@ def main():
     # greater_than_18.loc[:, columns_to_scale] = scaler.fit_transform(greater_than_18[columns_to_scale])
     # between_12_and_18.loc[:, columns_to_scale] = scaler.fit_transform(between_12_and_18[columns_to_scale])
 
-    db_final.to_csv('./data/normal/db_final.csv',index=False)
+    db_final.to_csv('./data/normal/df_final.csv',index=False)
     less_than_18.to_csv('./data/normal/db_age_less_than_18.csv', index=False)
     greater_than_18.to_csv('./data/normal/db_age_greater_than_18.csv',index=False)
     between_12_and_18.to_csv('./data/normal/db_age_between_12_and_18.csv',index=False)
