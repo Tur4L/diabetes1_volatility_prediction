@@ -3,6 +3,19 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import random
 
+'''
+Overlapping features:
+    id
+    timestamp/DeviceTM
+    Value
+    Age/AgeAsOfEnrollDt
+    Weight
+    Height
+    Sex
+    hbA1C
+
+'''
+
 def clean_aljc(df_aljc: pd.DataFrame) -> pd.DataFrame:
     df_aljc = df_aljc[['id','visit','treatment','sex','weight','height','age','hb_a1c',
                        'c_peptide_fasting','glucose_fasting']]

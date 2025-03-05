@@ -3,6 +3,7 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import random
 import warnings
+import matplotlib.pyplot as plt
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
@@ -12,17 +13,24 @@ def create_cgm_data():
     Creates CGM database
     '''
 
-    db_path = './data/normal/original/NonDiabDeviceCGM.csv'
-    db_cgm = pd.read_csv(db_path)
-    db_cgm = db_cgm[db_cgm['RecordType'] == 'CGM']
-    db_cgm['Value'] = db_cgm['Value'] / 18 #Converting mg/dl to mmol/l
-    db_cgm['DeviceTm'] = pd.to_timedelta(db_cgm['DeviceTm']).dt.total_seconds() + db_cgm['DeviceDtDaysFromEnroll'] * 86400
-    db_cgm['Scaled_Value'] = db_cgm['Value']
+    df_path = './data/normal/original/NonDiabDeviceCGM.csv'
+    df_cgm = pd.read_csv(df_path)
+    df_cgm = df_cgm[df_cgm['RecordType'] == 'CGM']
+    df_cgm['Value'] = df_cgm['Value'] / 18 #Converting mg/dl to mmol/l
 
-    db_cgm.drop(['RecordType','DeviceDtDaysFromEnroll'], axis=1, inplace=True)
+    df_cgm['DeviceTm_seconds'] = pd.to_timedelta(df_cgm['DeviceTm']).dt.total_seconds() + df_cgm['DeviceDtDaysFromEnroll'] * 86400
+    df_cgm['time_diff'] = df_cgm.groupby('PtID')['DeviceTm_seconds'].diff()
+    df_cons_intervals = df_cgm[(df_cgm['time_diff'] < 930) & (df_cgm['time_diff']>870)]
 
-    db_cgm.to_csv('./data/normal/db_cgm.csv', index=False)
-    return db_cgm
+    const_ratio = df_cons_intervals.shape[0]/df_cgm.shape[0]
+    print(const_ratio)
+
+    # df_cgm['Scaled_Value'] = df_cgm['Value']
+
+    df_cgm.drop(['RecordType', 'time_diff', 'DeviceTm_seconds'], axis=1, inplace=True)
+
+    df_cgm.to_csv('./data/normal/df_cgm.csv', index=False)
+    return df_cgm
 
 def create_medication_data():
     '''
@@ -188,10 +196,10 @@ def main():
     less_than_18, greater_than_18, between_12_and_18 = seperate_for_ages(db_final)
 
     columns_to_scale = ['DeviceTm','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
-    db_final.loc[:, columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
-    less_than_18.loc[:, columns_to_scale] = scaler.fit_transform(less_than_18[columns_to_scale])
-    greater_than_18.loc[:, columns_to_scale] = scaler.fit_transform(greater_than_18[columns_to_scale])
-    between_12_and_18.loc[:, columns_to_scale] = scaler.fit_transform(between_12_and_18[columns_to_scale])
+    # db_final.loc[:, columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
+    # less_than_18.loc[:, columns_to_scale] = scaler.fit_transform(less_than_18[columns_to_scale])
+    # greater_than_18.loc[:, columns_to_scale] = scaler.fit_transform(greater_than_18[columns_to_scale])
+    # between_12_and_18.loc[:, columns_to_scale] = scaler.fit_transform(between_12_and_18[columns_to_scale])
 
     db_final.to_csv('./data/normal/db_final.csv',index=False)
     less_than_18.to_csv('./data/normal/db_age_less_than_18.csv', index=False)

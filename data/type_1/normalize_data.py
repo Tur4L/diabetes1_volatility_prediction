@@ -378,12 +378,12 @@ def data_info(db_final):
 
 def main():
     full_db, full_db_beta, full_db_transplant = create_dbs()
-    db_final = lstm_data(full_db, full_db_beta.drop(['timestamp','is_relevant'], axis=1), full_db_transplant)
+    df_final = lstm_data(full_db, full_db_beta.drop(['timestamp','is_relevant'], axis=1), full_db_transplant)
     data_info(db_final)
 
     columns_to_scale = ['DeviceTm','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
-    db_final[columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
-    db_final.to_csv('./data/type_1/db_final.csv', index=False)
+    df_final[columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
+    db_final.to_csv('./data/type_1/df_final.csv', index=False)
 
 
     # windowed_db = match_cgm_beta2(full_db, full_db_beta, full_db_transplant)
