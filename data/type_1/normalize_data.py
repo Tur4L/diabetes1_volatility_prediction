@@ -382,8 +382,8 @@ def main():
     data_info(df_final)
 
     columns_to_scale = ['DeviceTm','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
-    df_final[columns_to_scale] = scaler.fit_transform(db_final[columns_to_scale])
-    db_final.to_csv('./data/type_1/df_final.csv', index=False)
+    df_final[columns_to_scale] = scaler.fit_transform(df_final[columns_to_scale])
+    df_final.to_csv('./data/type_1/df_final.csv', index=False)
 
 
     # windowed_db = match_cgm_beta2(full_db, full_db_beta, full_db_transplant)
