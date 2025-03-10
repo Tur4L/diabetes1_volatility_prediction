@@ -21,21 +21,27 @@ def length_data(db):
 
     for i in range(index+1, index+len(db)):
         delta_time = db.loc[i, 'time_minutes'] - db.loc[i - 1, 'time_minutes']
+        if delta_time > 16:
+            return distance_final, distance_final/(i-index+1)
+
         delta_glucose = db.loc[i, 'glucose mmol/l'] - db.loc[i - 1, 'glucose mmol/l']
         distance = np.sqrt(delta_time**2 + delta_glucose**2)
         distance_final += distance
-
-    return distance_final, distance_final/len(db)
-
+        
 if __name__ == "__main__":
-    db = pd.read_csv('./data/type_1/db_windowed_all.csv')
-    grouped_patients = db.groupby('window_id')
+    db = pd.read_csv('./data/type_1/df_final.csv')
+    grouped_patients = db.groupby('id')
     
-    for window_id, patient_db in grouped_patients:
-        patient_id = patient_db.iloc[0,2]
-        beta2_score = patient_db.iloc[0,3]
-        print(f'Analysis for patient {patient_id}, BETA2 Score: {beta2_score}:')
-
+    patients_analysis = {}
+    patients_analysis['id'] = []
+    patients_analysis['total_length'] = []
+    patients_analysis['normalized_length'] = []
+    for patient_id, patient_db in grouped_patients:
         length, norm_length = length_data(patient_db)
-        print(f'\tTotal length is: {length}')
-        print(f'\tNormalized length is: {norm_length}\n')
+
+        patients_analysis['id'].append(patient_id)
+        patients_analysis['total_length'].append(length)
+        patients_analysis['normalized_length'].append(norm_length)
+
+    df_patients_analysis = pd.DataFrame(patients_analysis)
+    df_patients_analysis.to_csv('./data/type_1/df_analysis.csv', index=False)

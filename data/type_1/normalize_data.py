@@ -142,24 +142,24 @@ def interpolate_data(db_patient, db_beta):
     return db_patient
 
 def lstm_data(db_cgm, db_beta, db_transplants):
-    db_final = db_cgm.copy()
-    db_final = db_final[~(db_final['patient_id'] == 1)]
+    df_final = db_cgm.copy()
+    df_final = df_final[~(df_final['patient_id'] == 1)]
 
     #TODO Add 'Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c','Gender'.
-    db_final.rename(columns={'glucose mmol/l':'Value','timestamp':'DeviceTm', 'patient_id':'PtID'}, inplace=True)
-    db_final['Scaled_Value'] = db_final[['Value']]
-    db_final['AgeAsOfEnrollDt'] = 0
-    db_final['Weight'] = 0.0
-    db_final['Height'] = 0.0
-    db_final['HbA1c'] = 0.0
-    db_final['Gender'] = 0
+    df_final.rename(columns={'glucose mmol/l':'Value','timestamp':'DeviceTm', 'patient_id':'PtID'}, inplace=True)
+    df_final['scaled_glucose'] = df_final[['Value']]
+    df_final['AgeAsOfEnrollDt'] = 0
+    df_final['Weight'] = 0.0
+    df_final['Height'] = 0.0
+    df_final['HbA1c'] = 0.0
+    df_final['Gender'] = 0
 
     #Age added
-    db_final.loc[db_final['PtID'] == 2, 'AgeAsOfEnrollDt'] = 47
-    db_final.loc[db_final['PtID'] == 3, 'AgeAsOfEnrollDt'] = 34
-    db_final.loc[db_final['PtID'] == 4, 'AgeAsOfEnrollDt'] = 42
-    db_final.loc[db_final['PtID'] == 5, 'AgeAsOfEnrollDt'] = 45
-    db_final.loc[db_final['PtID'] == 6, 'AgeAsOfEnrollDt'] = 60
+    df_final.loc[df_final['PtID'] == 2, 'AgeAsOfEnrollDt'] = 47
+    df_final.loc[df_final['PtID'] == 3, 'AgeAsOfEnrollDt'] = 34
+    df_final.loc[df_final['PtID'] == 4, 'AgeAsOfEnrollDt'] = 42
+    df_final.loc[df_final['PtID'] == 5, 'AgeAsOfEnrollDt'] = 45
+    df_final.loc[df_final['PtID'] == 6, 'AgeAsOfEnrollDt'] = 60
 
     #Weight added
     #TODO
@@ -168,28 +168,28 @@ def lstm_data(db_cgm, db_beta, db_transplants):
     #TODO
 
     #HbA1c added
-    db_final.loc[db_final['PtID'] == 2, 'HbA1c'] = 8.5
-    db_final.loc[db_final['PtID'] == 3, 'HbA1c'] = 8.0
-    db_final.loc[db_final['PtID'] == 4, 'HbA1c'] = 7.5
-    db_final.loc[db_final['PtID'] == 5, 'HbA1c'] = 7.6
-    db_final.loc[db_final['PtID'] == 6, 'HbA1c'] = 0.0
+    df_final.loc[df_final['PtID'] == 2, 'HbA1c'] = 8.5
+    df_final.loc[df_final['PtID'] == 3, 'HbA1c'] = 8.0
+    df_final.loc[df_final['PtID'] == 4, 'HbA1c'] = 7.5
+    df_final.loc[df_final['PtID'] == 5, 'HbA1c'] = 7.6
+    df_final.loc[df_final['PtID'] == 6, 'HbA1c'] = 0.0
 
     #Gender added
-    db_final.loc[db_final['PtID'].isin([4,5]), 'Gender'] = 1
+    df_final.loc[df_final['PtID'].isin([4,5]), 'Gender'] = 1
 
     #Fix DeviceTM to seconds. Start date being the first date entry
     #TODO
-    db_final['DeviceTm'] = pd.to_datetime(db_final['DeviceTm'])
-    db_final['DeviceTm'] = db_final.groupby('PtID')['DeviceTm'].transform(
+    df_final['DeviceTm'] = pd.to_datetime(df_final['DeviceTm'])
+    df_final['timestamp_seconds'] = df_final.groupby('PtID')['DeviceTm'].transform(
         lambda x: (x-x.min()).dt.total_seconds())
 
-    return db_final
+    return df_final
     
-def match_cgm_beta2(db_full, db_beta, db_transplant):
+def match_cgm_beta2(df_full, db_beta, db_transplant):
     '''This function is for implementing -/+ 30 days window from the beta2 score for the CGM data'''
 
     #Note: Currently we do not have access to the JL beta2 scores and dates, therefore, we will skip that data.
-    db_match_full = db_full[db_full['patient_id'] != 1]
+    db_match_full = df_full[df_full['patient_id'] != 1]
     db_match_beta = db_beta
     db_match_transplant = db_transplant[db_transplant['patient_id'] != 1]
 
@@ -290,7 +290,8 @@ def normalize_cd(db):
     ''' Cleans csv file of the patient CD'''
 
     #creating initial db
-    normalized_db = db.iloc[:,[1,7]]
+    normalized_db = db[db['Event Type'] == 'EVG']
+    normalized_db = normalized_db.iloc[:,[1,7]]
     normalized_db.columns = ["timestamp", "glucose mmol/l"]
     normalized_db = normalized_db.dropna(subset=['glucose mmol/l'])
 
@@ -347,19 +348,21 @@ def window_3days(selected_window, end_date):
 
     return sub_window
 
-def data_info(db_final):
+def data_info(df_final):
+    df_final.rename(columns={'DeviceTm':'timestamp', 'Value':'glucose mmol/l', 'AgeAsOfEnrollDt':'age',
+                            'Weight':'weight', 'Height':'height', 'HbA1c':'hb_a1c', 'PtID': 'id', 'Gender': 'sex'}, inplace=True)
 
-    no_dup_df = db_final.drop_duplicates(subset='PtID')
+    no_dup_df = df_final.drop_duplicates(subset='id')
 
-    num_people = no_dup_df['PtID'].size
+    num_people = no_dup_df['id'].size
 
-    num_male = no_dup_df[no_dup_df['Gender'] == 0].shape[0]
-    num_female = no_dup_df[no_dup_df['Gender'] == 1].shape[0]
+    num_male = no_dup_df[no_dup_df['sex'] == 0].shape[0]
+    num_female = no_dup_df[no_dup_df['sex'] == 1].shape[0]
 
-    min_age = no_dup_df['AgeAsOfEnrollDt'].min()
-    max_age = no_dup_df['AgeAsOfEnrollDt'].max()
-    num_less_than_18 = no_dup_df[no_dup_df['AgeAsOfEnrollDt'] < 18].shape[0]
-    num_18_or_older = no_dup_df[no_dup_df['AgeAsOfEnrollDt'] >= 18].shape[0]
+    min_age = no_dup_df['age'].min()
+    max_age = no_dup_df['age'].max()
+    num_less_than_18 = no_dup_df[no_dup_df['age'] < 18].shape[0]
+    num_18_or_older = no_dup_df[no_dup_df['age'] >= 18].shape[0]
 
     print('Islet transplant data info:\n')
     print(f'Number of patients: {num_people}')
@@ -377,15 +380,17 @@ def data_info(db_final):
     print('CGM availability: Yes\nCGM device: Dexcom and FreeStyle Libre\nCGM interval: 5 and 15 minutes respectively')
 
 def main():
-    full_db, full_db_beta, full_db_transplant = create_dbs()
-    df_final = lstm_data(full_db, full_db_beta.drop(['timestamp','is_relevant'], axis=1), full_db_transplant)
+    full_df, full_df_beta, full_df_transplant = create_dbs()
+    df_final = lstm_data(full_df, full_df_beta.drop(['timestamp','is_relevant'], axis=1), full_df_transplant)
     data_info(df_final)
 
-    columns_to_scale = ['DeviceTm','Scaled_Value','AgeAsOfEnrollDt','Weight','Height','HbA1c']
+    columns_to_scale = ['timestamp_seconds','scaled_glucose','age','weight','height','hb_a1c']
     df_final[columns_to_scale] = scaler.fit_transform(df_final[columns_to_scale])
+    df_final = df_final[['id','timestamp','timestamp_seconds','glucose mmol/l', 'scaled_glucose', 'age', 'weight', 'height', 'sex', 'hb_a1c']]
+    full_df.to_csv('./data/type_1/df_cgm.csv')
     df_final.to_csv('./data/type_1/df_final.csv', index=False)
 
-    windowed_db = match_cgm_beta2(full_db, full_db_beta, full_db_transplant)
+    windowed_db = match_cgm_beta2(full_df, full_df_beta, full_df_transplant)
     patient_windowed_db = patient_beta2_windows(windowed_db,4)
  
 

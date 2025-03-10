@@ -42,8 +42,8 @@ def create_cgm_data():
     df_cgm['timestamp'] = initial_date + pd.to_timedelta(df_cgm['DeviceDtDaysFromEnroll'], unit='D')
     df_cgm['timestamp'] = pd.to_datetime(df_cgm['timestamp'].astype(str) + ' ' + df_cgm['DeviceTm'])
 
-    # const_ratio = df_cons_intervals.shape[0]/df_cgm.shape[0]
-    # print(const_ratio)
+    const_ratio = df_cons_intervals.shape[0]/df_cgm.shape[0]
+    print(const_ratio)
 
     df_cgm.drop(['RecordType', 'time_diff', 'DeviceTm', 'DeviceDtDaysFromEnroll', 'Value'], axis=1, inplace=True)
 
@@ -136,12 +136,10 @@ def create_screening_data():
                        'HbA1cTestDtDaysFromEnroll', 'WorkType','Ethnicity',
                        'LastMenstCycStartDtDaysFromEnroll','LastMenstCycStartDtUnk',
                        'LastMenstCycStartDtNA','LastMenstCycEndDtDaysFromEnroll','LastMenstCycEndDtUnk',
-                       'LastMenstCycEndDtNA'], axis=1, inplace=True)
+                       'LastMenstCycEndDtNA','T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk',
+                       'T1DBioFamily'], axis=1, inplace=True)
     
     df_screening['Gender'] = df_screening['Gender'].map({'M' : 0, 'F': 1})
-    df_screening['T1DBioFamily'] = df_screening['T1DBioFamily'].map({'No' : 0, 'Yes': 1})
-    df_screening[['T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk']] = df_screening[['T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk']].fillna(0)
-
     # df_screening.to_csv('./data/jaeb_healthy/df_screening.csv', index=False)
     return df_screening
 
@@ -210,7 +208,11 @@ def main():
     greater_than_18.loc[:, columns_to_scale] = scaler.fit_transform(greater_than_18[columns_to_scale])
     between_12_and_18.loc[:, columns_to_scale] = scaler.fit_transform(between_12_and_18[columns_to_scale])
 
+    df_final.rename(columns={'DeviceTm':'timestamp', 'Value':'glucose mmol/l', 'AgeAsOfEnrollDt':'age',
+                            'Weight':'weight', 'Height':'height', 'HbA1c':'hb_a1c', 'PtID': 'id', 'Gender': 'sex'}, inplace=True)
+    df_final = df_final[['id','timestamp','timestamp_seconds','glucose mmol/l', 'scaled_glucose', 'age', 'weight', 'height', 'sex', 'hb_a1c']]
     df_final.to_csv('./data/jaeb_healthy/df_final.csv',index=False)
+    
     # less_than_18.to_csv('./data/jaeb_healthy/df_age_less_than_18.csv', index=False)
     # greater_than_18.to_csv('./data/jaeb_healthy/df_age_greater_than_18.csv',index=False)
     # between_12_and_18.to_csv('./data/jaeb_healthy/df_age_between_12_and_18.csv',index=False)

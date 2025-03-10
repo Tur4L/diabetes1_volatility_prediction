@@ -26,14 +26,10 @@ agg_diagnode_data = diagnode_data[overlapping_features]
 agg_diagnode_data.loc[:, 'id'] = 'diagnode_' + agg_diagnode_data['id']
 
 #Prepping Islet transplant data
-agg_islet_tp_data = islet_tp_data.rename(columns={'DeviceTm':'timestamp', 'Value':'glucose mmol/l', 'AgeAsOfEnrollDt':'age',
-                                        'Weight':'weight', 'Height':'height', 'HbA1c':'hb_a1c', 'PtID': 'id', 'Gender': 'sex'})
 agg_islet_tp_data = agg_islet_tp_data[overlapping_features]
 agg_islet_tp_data['id'] = 'islet_' + agg_islet_tp_data['id'].astype('str')
  
 #Prepping JAEB data
-agg_jaeb_data = jaeb_data.rename(columns={'DeviceTm':'timestamp', 'Value':'glucose mmol/l', 'AgeAsOfEnrollDt':'age',
-                                        'Weight':'weight', 'Height':'height', 'HbA1c':'hb_a1c', 'PtID': 'id', 'Gender': 'sex'})
 agg_jaeb_data = agg_jaeb_data[overlapping_features]
 agg_jaeb_data['id'] = 'jaeb_' + agg_jaeb_data['id'].astype('str')
 
