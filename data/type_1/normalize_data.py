@@ -385,9 +385,8 @@ def main():
     df_final[columns_to_scale] = scaler.fit_transform(df_final[columns_to_scale])
     df_final.to_csv('./data/type_1/df_final.csv', index=False)
 
-
-    # windowed_db = match_cgm_beta2(full_db, full_db_beta, full_db_transplant)
-    # patient_windowed_db = patient_beta2_windows(windowed_db,4)
+    windowed_db = match_cgm_beta2(full_db, full_db_beta, full_db_transplant)
+    patient_windowed_db = patient_beta2_windows(windowed_db,4)
  
 
 if __name__ == "__main__":

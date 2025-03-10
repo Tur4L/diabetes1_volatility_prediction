@@ -4,7 +4,7 @@ import numpy as np
 
 diagnode_data = pd.read_csv('./data/diagnode/df_final.csv')
 islet_tp_data = pd.read_csv('./data/type_1/df_final.csv')
-jaeb_data = pd.read_csv('./data/normal/df_final.csv')
+jaeb_data = pd.read_csv('./data/jaeb_healthy/df_final.csv')
 
 '''
 Overlapping features:

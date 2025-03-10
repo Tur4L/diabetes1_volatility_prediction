@@ -13,21 +13,12 @@ def clean_cgm(df_cgm: pd.DataFrame) -> pd.DataFrame:
     df_cgm = df_cgm[['id','visit','TIMESTAMP','GLUCOSE']]
     df_cgm.rename(columns={'TIMESTAMP': 'timestamp', 'GLUCOSE': 'glucose mmol/l'}, inplace=True)
     df_cgm['timestamp'] = pd.to_datetime(df_cgm['timestamp'], format = "%Y-%m-%d %H:%M:%S", errors ='coerce')
-    df_cgm.loc[:,'timestamp'] = df_cgm.groupby('id')['timestamp'].transform(
+    df_cgm['timestamp_seconds'] = df_cgm.groupby('id')['timestamp'].transform(
         lambda x: (x-x.min()).dt.total_seconds())
 
     df_cgm.to_csv('./data/diagnode/df_cgm.csv')
 
     return df_cgm
-
-def match_cgm_aljc(df_cgm: pd.DataFrame, df_aljc: pd.DataFrame) -> pd.DataFrame:
-    df_cgm = clean_cgm(df_cgm)
-    df_aljc = clean_aljc(df_aljc)
-
-    df_final = pd.merge(df_cgm, df_aljc, on=['id','visit'], how='inner')
-    df_final.to_csv('./data/diagnode/df_final.csv', index=False)
-
-    return df_final
 
 def data_info(df_aljc, df_cgm):
 
@@ -63,6 +54,14 @@ def data_info(df_aljc, df_cgm):
     # print('\n\tRace division:')
     # print(num_races)
 
+def match_cgm_aljc(df_cgm: pd.DataFrame, df_aljc: pd.DataFrame) -> pd.DataFrame:
+    df_cgm = clean_cgm(df_cgm)
+    df_aljc = clean_aljc(df_aljc)
+
+    df_final = pd.merge(df_cgm, df_aljc, on=['id','visit'], how='inner')
+    df_final.to_csv('./data/diagnode/df_final.csv', index=False)
+
+    return df_final
  
 def main():
     df_cgm = pd.read_csv('./data/diagnode/original/CGM_RANDOMISED_preprocessed.csv')
