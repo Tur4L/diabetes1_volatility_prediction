@@ -290,7 +290,7 @@ def normalize_cd(db):
     ''' Cleans csv file of the patient CD'''
 
     #creating initial db
-    normalized_db = db[db['Event Type'] == 'EVG']
+    normalized_db = db[db['Event Type'] == 'EGV']
     normalized_db = normalized_db.iloc[:,[1,7]]
     normalized_db.columns = ["timestamp", "glucose mmol/l"]
     normalized_db = normalized_db.dropna(subset=['glucose mmol/l'])
@@ -390,8 +390,8 @@ def main():
     full_df.to_csv('./data/type_1/df_cgm.csv')
     df_final.to_csv('./data/type_1/df_final.csv', index=False)
 
-    windowed_db = match_cgm_beta2(full_df, full_df_beta, full_df_transplant)
-    patient_windowed_db = patient_beta2_windows(windowed_db,4)
+    # windowed_db = match_cgm_beta2(full_df, full_df_beta, full_df_transplant)
+    # patient_windowed_db = patient_beta2_windows(windowed_db,4)
  
 
 if __name__ == "__main__":

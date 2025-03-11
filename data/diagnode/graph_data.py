@@ -13,22 +13,45 @@ def graph_data():
     plt.legend()
     plt.savefig('./data/normalized/jl_graphed.png')
 
-def length_data(db):
-    db['timestamp'] = pd.to_datetime(db['timestamp'])
-    db['time_minutes'] = (db['timestamp'] - db['timestamp'].min()).dt.total_seconds()/60
-    distance_final = 0
-    index = int(db.index[0])
+def length_data(df):
+    df = df.copy()
 
-    for i in range(index+1, index+len(db)):
-        delta_time = db.loc[i, 'time_minutes'] - db.loc[i - 1, 'time_minutes']
-        if delta_time > 16:
-            return distance_final, distance_final/(i-index+1)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    median_time_interval = (df['timestamp'].diff().median()).seconds / 60
+    
+    if median_time_interval < 6:
+        df = df.iloc[::3].reset_index(drop=True)
 
-        delta_glucose = db.loc[i, 'glucose mmol/l'] - db.loc[i - 1, 'glucose mmol/l']
-        distance = np.sqrt(delta_time**2 + delta_glucose**2)
-        distance_final += distance
+    total_diff_i = 0
+    total_diff_t = 0
+    valid_diffs = 0
 
-    return distance_final, distance_final/len(db)
+    for i in range(1,df.shape[0]):
+        current_time_interval = (df.iloc[i]['timestamp'] - df.iloc[i-1]['timestamp']).total_seconds() / 60
+
+        if current_time_interval > 16:
+            total_diff_t += total_diff_i
+            total_diff_i = 0
+
+        else:  
+            glucose_diff = abs(df.iloc[i]['glucose mmol/l'] - df.iloc[i-1]['glucose mmol/l'])
+            glucose_diff *= 18
+            total_diff_i += glucose_diff
+            valid_diffs += 1
+
+    total_diff_t += total_diff_i
+
+    return total_diff_t, total_diff_t/max(valid_diffs,1)
+
+def hypoglycemia_rates(df):
+    df = df.copy()
+    df_hypo_level_1 = df[(df['glucose mmol/l'] < 3.9) & (df['glucose mmol/l'] >= 3.0)]
+    df_hypo_level_2 = df[df['glucose mmol/l'] < 3.0]
+
+    level_1 = df_hypo_level_1.shape[0]
+    level_2 = df_hypo_level_2.shape[0]
+
+    return level_1, level_2
 
 if __name__ == "__main__":
     db = pd.read_csv('./data/diagnode/df_final.csv')
@@ -38,12 +61,18 @@ if __name__ == "__main__":
     patients_analysis['id'] = []
     patients_analysis['total_length'] = []
     patients_analysis['normalized_length'] = []
+    patients_analysis['hypoglycemia_level_1'] = []
+    patients_analysis['hypoglycemia_level_2'] = []
+
     for patient_id, patient_db in grouped_patients:
         length, norm_length = length_data(patient_db)
+        level_1, level_2 = hypoglycemia_rates(patient_db)
 
         patients_analysis['id'].append(patient_id)
         patients_analysis['total_length'].append(length)
         patients_analysis['normalized_length'].append(norm_length)
+        patients_analysis['hypoglycemia_level_1'].append(level_1)
+        patients_analysis['hypoglycemia_level_2'].append(level_2)
 
     df_patients_analysis = pd.DataFrame(patients_analysis)
     df_patients_analysis.to_csv('./data/diagnode/df_analysis.csv', index=False)
