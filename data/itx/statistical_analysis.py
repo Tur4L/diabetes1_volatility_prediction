@@ -55,7 +55,7 @@ def hypoglycemia_rates(df):
     return level_1, level_2
 
 if __name__ == "__main__":
-    df = pd.read_csv('./data/type_1/df_final.csv')
+    df = pd.read_csv('./data/itx/df_final.csv')
     grouped_patients = df.groupby('id')
     
     patients_analysis = {}
@@ -76,4 +76,4 @@ if __name__ == "__main__":
         patients_analysis['hypoglycemia_level_2'].append(level_2)
 
     df_patients_analysis = pd.DataFrame(patients_analysis)
-    df_patients_analysis.to_csv('./data/type_1/df_analysis.csv', index=False)
+    df_patients_analysis.to_csv('./data/itx/df_analysis.csv', index=False)
