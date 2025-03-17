@@ -109,7 +109,9 @@ class DataAnalysis:
 
         df_cgm.to_csv(f'{csv_folder}/df_cgm.csv', index=False)
         df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
-        return         
+
+        return df_final    
+
     def preprocess_jaeb_healthy(self, csv_folder):
         """Custom preprocessing for JAEB healthy dataset."""
 
@@ -168,6 +170,7 @@ class DataAnalysis:
         return df_final
 
     def preprocess_jaeb_t1d(self, csv_folder):
+        '''Custom preprocessing for JABE Type 1 Diabetes Dataset'''
         #CGM data
         df_cgm = pd.read_csv(f'{csv_folder}/original/2025-03-13_T1D_JAEB_C-path_CGM_clean.csv')
         df_cgm.rename(columns={'PtID':'id','DeviceTm': 'timestamp', 'Value' : 'glucose mmol/l'}, inplace=True)
@@ -177,6 +180,7 @@ class DataAnalysis:
         
         #TODO: Add other features once i get them
         df_final = df_cgm
+        df_final.to_csv(f'{csv_folder}/df_final.csv')
         return df_final
 
     def get_dataset(self, name):
@@ -197,36 +201,79 @@ class DataAnalysis:
         if median_time_interval < 6:
             df = df.iloc[::3].reset_index(drop=True)
 
-        total_diff_i = 0
-        total_diff_t = 0
+        total_distance_i = 0
+        total_distance_t = 0
+        total_time_i = 0
+        total_time_t = 0
         valid_diffs = 0
 
         for i in range(1,df.shape[0]):
             current_time_interval = (df.iloc[i]['timestamp'] - df.iloc[i-1]['timestamp']).total_seconds() / 60
 
             if current_time_interval > 16:
-                total_diff_t += total_diff_i
-                total_diff_i = 0
+                total_distance_t += total_distance_i
+                total_time_t += total_time_i
+
+                total_distance_i = 0
+                total_time_i = 0
 
             else:  
-                glucose_diff = abs(df.iloc[i]['glucose mmol/l'] - df.iloc[i-1]['glucose mmol/l'])
-                glucose_diff *= 18
-                total_diff_i += glucose_diff
+                current_glucose_diff = abs(df.iloc[i]['glucose mmol/l'] - df.iloc[i-1]['glucose mmol/l'])
+                current_glucose_diff *= 18 #Converting mmol/l to mg/dl
+                current_time_diff = current_time_interval/60 #Converting minutes to hours
+
+                total_distance_i += np.sqrt(current_time_diff**2 + current_glucose_diff**2)
+                total_time_i += current_time_diff 
                 valid_diffs += 1
 
-        total_diff_t += total_diff_i
+        total_distance_t += total_distance_i
+        total_time_t += total_time_i
 
-        return total_diff_t, total_diff_t/max(valid_diffs,1)
+        return total_distance_t, total_distance_t/max(valid_diffs,1)
     
     def hypoglycemia_rates(self, df):
         df = df.copy()
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
         df_hypo_level_1 = df[(df['glucose mmol/l'] < 3.9) & (df['glucose mmol/l'] >= 3.0)]
         df_hypo_level_2 = df[df['glucose mmol/l'] < 3.0]
 
         level_1 = df_hypo_level_1.shape[0]
         level_2 = df_hypo_level_2.shape[0]
+        
+        #TODO: Add clinically significant hypos as feature.
+        median_time_interval = (df['timestamp'].diff().median()).seconds / 60
+        if median_time_interval < 6:
+            df_clinically_significant = df.iloc[::3].reset_index(drop=True)
+        else:
+            df_clinically_significant = df
+        
+        event_start = False
+        num_events = 0
+        for i in range(df_clinically_significant.shape[0]-1):
+            current_glucose = df_clinically_significant.iloc[i]['glucose mmol/l']
+            next_glucose = df_clinically_significant.iloc[i+1]['glucose mmol/l']
+            current_time = df_clinically_significant.iloc[i]['timestamp']
+            next_time = df_clinically_significant.iloc[i+1]['timestamp']
+            time_diff = (next_time - current_time).total_seconds()/60
 
-        return level_1, level_2
+            if time_diff < 16:
+                if current_glucose < 3.0:
+                    if next_glucose < 3.0:
+                        event_start = True
+
+                if event_start:
+                    if current_glucose > 3.9:
+                        if next_glucose > 3.9:
+                            event_start = False
+                            num_events += 1
+
+            else:
+                if event_start:
+                    event_start = False
+                    if next_glucose > 3.9:
+                        num_events += 1
+
+        return level_1, level_2, num_events
     
     def statystical_analysis(self, csv_folder, df):
         df = df.copy()
@@ -238,22 +285,40 @@ class DataAnalysis:
         patients_analysis['normalized_length'] = []
         patients_analysis['hypoglycemia_level_1'] = []
         patients_analysis['hypoglycemia_level_2'] = []
+        patients_analysis['clinically_significant_hypoglycemia'] = []
 
         for patient_id, patient_db in grouped_patients:
             length, norm_length = self.length_data(patient_db)
-            level_1, level_2 = self.hypoglycemia_rates(patient_db)
+            level_1, level_2, cl_sig_events = self.hypoglycemia_rates(patient_db)
 
             patients_analysis['id'].append(patient_id)
             patients_analysis['total_length'].append(length)
             patients_analysis['normalized_length'].append(norm_length)
             patients_analysis['hypoglycemia_level_1'].append(level_1)
             patients_analysis['hypoglycemia_level_2'].append(level_2)
+            patients_analysis['clinically_significant_hypoglycemia'].append(cl_sig_events)
 
         df_patients_analysis = pd.DataFrame(patients_analysis)
         df_patients_analysis.to_csv(f'{csv_folder}/df_analysis.csv', index=False)
 
 
-
 if __name__ == '__main__':
     data_analysis = DataAnalysis()
+
+    #Analyze Diagnode dataset
+    df_diagnode = data_analysis.get_dataset('diagnode')
+    data_analysis.statystical_analysis('./data/diagnode', df_diagnode)
+
+    #Analyze Islet Transplant dataset
+    df_itx = data_analysis.get_dataset('itx')
+    data_analysis.statystical_analysis('./data/itx', df_itx)
+
+    #Analyze JAEB Healthy dataset
+    df_jaeb_healthy = data_analysis.get_dataset('jaeb_healthy')
+    data_analysis.statystical_analysis('./data/jaeb_healthy', df_jaeb_healthy)
+
+    #Analyze JAEB Type 1 Diabetes dataset
+    df_jaeb_t1d = data_analysis.get_dataset('jaeb_t1d')
+    data_analysis.statystical_analysis('./data/jaeb_t1d', df_jaeb_t1d)
+
     pass
