@@ -1,5 +1,5 @@
-#create_data.py
-create_data.py
+#data folder
+data/
 
 # Lightning logs
 lightning_logs/
