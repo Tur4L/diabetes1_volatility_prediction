@@ -40,38 +40,38 @@ logging.getLogger("lightning.pytorch.utilities.rank_zero").setLevel(logging.WARN
 logging.getLogger("lightning.pytorch.accelerators.cuda").setLevel(logging.WARNING)
 
 #Reading data
-df_path = "./data/normal/db_final.csv"
+df_path = "./data/jaeb_t1d/df_final.csv"
 df = pd.read_csv(df_path) 
 tft_data = transformer_data(df, MAX_ENCODER_LENGTH, MAX_PREDICTION_LENGTH)
 
 #Creating KFolds:
 gkf = GroupKFold(n_splits=N_SPLIT)
-groups = tft_data['PtID']
+groups = tft_data['id']
 
 t_MAE,t_gMAE,t_RMSE,t_gRMSE,t_MAPE,t_MARD,t_gMARD = [0.0,0.0], [0.0,0.0], [0.0,0.0], [0.0,0.0], [0.0,0.0], [0.0,0.0], [0.0,0.0]
 for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=groups)):
     train_val_df = tft_data.iloc[train_idx]
-    train_groups, val_groups = train_test_split(train_val_df["PtID"].unique(), test_size=0.3, random_state=42)
+    train_groups, val_groups = train_test_split(train_val_df["id"].unique(), test_size=0.3, random_state=42)
 
-    train_df = train_val_df[train_val_df["PtID"].isin(train_groups)]
-    val_df = train_val_df[train_val_df["PtID"].isin(val_groups)]
+    train_df = train_val_df[train_val_df["id"].isin(train_groups)]
+    val_df = train_val_df[train_val_df["id"].isin(val_groups)]
     test_df = tft_data.iloc[test_idx]
 
     #Time Series Data Set creating for TFT
-    static_reals = ["AgeAsOfEnrollDt", "Weight", "Height","HbA1c",'Gender']
+    static_reals = ["age", "weight", "height","hb_a1c",'sex']
     time_varying_known_reals = []
-    time_varying_unknown_reals = ['Value', 'Scaled_Value']
-    group_ids = ['PtID']
+    time_varying_unknown_reals = ['glucose mmol/l']
+    group_ids = ['id']
 
 
     training = TimeSeriesDataSet(
         train_df,
         time_idx="time_idx",
-        target="Value",
+        target="glucose mmol/l",
         group_ids=group_ids,
         max_encoder_length=MAX_ENCODER_LENGTH,
         max_prediction_length=MAX_PREDICTION_LENGTH,
-        categorical_encoders={"PtID": NaNLabelEncoder(add_nan=True)},
+        categorical_encoders={"id": NaNLabelEncoder(add_nan=True)},
         static_reals=static_reals,
         time_varying_known_reals=time_varying_known_reals,
         time_varying_unknown_reals=time_varying_unknown_reals,
@@ -104,8 +104,8 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     #Callbacks
     early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
     lr_logger = LearningRateMonitor()  # log the learning rate
-    tensorboard_logger = TensorBoardLogger(save_dir="./data/normal/predictions/tft")
-    checkpoint_callback = ModelCheckpoint(dirpath="./data/normal/predictions/tft/checkpoints",
+    tensorboard_logger = TensorBoardLogger(save_dir="./data/jaeb_t1d/predictions/tft")
+    checkpoint_callback = ModelCheckpoint(dirpath="./data/jaeb_t1d/predictions/tft/checkpoints",
                                         filename="best_model",
                                         save_top_k=1,
                                         monitor="val_loss",
@@ -114,7 +114,7 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
 
     #Trainer
     trainer = pl.Trainer(
-        max_epochs=10,
+        max_epochs=1,
         accelerator="gpu",
         strategy='ddp',
         devices="auto",
@@ -184,14 +184,14 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
 
     # Calculate errors
     pt_num = 0
-    grouped_test = test_df.groupby(['PtID'])
+    grouped_test = test_df.groupby(['id'])
     pt_length = len(grouped_test)
     y_predictions = np.array([])
     y_actuals = np.array([])
 
     #looping over each patient:
     for ptid, group in grouped_test:
-        test_ptid = test_df.loc[test_df['PtID'] == ptid]
+        test_ptid = test_df.loc[test_df['id'] == ptid]
         y_predictions_ptid = np.array([])
         y_actuals_ptid = np.array([])
 
@@ -233,20 +233,20 @@ for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(tft_data, groups=grou
     t_gMARD[0] += i_gMARD[0]
     t_gMARD[1] += i_gMARD[1]
 
-#Metrics:
-metrics = {
-    'MAE': f'{t_MAE[0]/N_SPLIT} +- {t_MAE[1]/N_SPLIT}',
-    't_gMAE': f'{t_gMAE[0]/N_SPLIT} +- {t_gMAE[1]/N_SPLIT}',
-    't_RMSE': f'{t_RMSE[0]/N_SPLIT} +- {t_RMSE[1]/N_SPLIT}',
-    't_gRMSE': f'{t_gRMSE[0]/N_SPLIT} +- {t_gRMSE[1]/N_SPLIT}',
-    't_MAPE': f'{t_MAPE[0]/N_SPLIT} +- {t_MAPE[1]/N_SPLIT}',
-    't_MARD': f'{t_MARD[0]/N_SPLIT} +- {t_MARD[1]/N_SPLIT}',
-    't_gMARD': f'{t_gMARD[0]/N_SPLIT} +- {t_gMARD[1]/N_SPLIT}'
-}
-wandb.log(metrics)
+    #Metrics:
+    metrics = {
+        'MAE': f'{t_MAE[0]/N_SPLIT} +- {t_MAE[1]/N_SPLIT}',
+        't_gMAE': f'{t_gMAE[0]/N_SPLIT} +- {t_gMAE[1]/N_SPLIT}',
+        't_RMSE': f'{t_RMSE[0]/N_SPLIT} +- {t_RMSE[1]/N_SPLIT}',
+        't_gRMSE': f'{t_gRMSE[0]/N_SPLIT} +- {t_gRMSE[1]/N_SPLIT}',
+        't_MAPE': f'{t_MAPE[0]/N_SPLIT} +- {t_MAPE[1]/N_SPLIT}',
+        't_MARD': f'{t_MARD[0]/N_SPLIT} +- {t_MARD[1]/N_SPLIT}',
+        't_gMARD': f'{t_gMARD[0]/N_SPLIT} +- {t_gMARD[1]/N_SPLIT}'
+    }
+    wandb.log(metrics)
 
 metrics_df = pd.DataFrame(metrics,index=[0])
-metrics_df.to_csv('./data/normal/predictions/tft/metrics.csv', index=False)
+metrics_df.to_csv('./data/jaeb_t1d/predictions/tft/metrics.csv', index=False)
 
 
 print(f"t_MAE: {t_MAE[0]/N_SPLIT} +- {t_MAE[1]/N_SPLIT}")
@@ -261,12 +261,12 @@ print(f"t_gMARD: {t_gMARD[0]/N_SPLIT} +- {t_gMARD[1]/N_SPLIT}")
 #Plots:
 raw_predictions = best_tft.predict(test_dataloader, mode="raw", return_x=True)
 prediction = 0
-best_tft.plot_prediction(raw_predictions.x, raw_predictions.output, idx=0, add_loss_to_title=True,).savefig(f'./data/normal/predictions/tft/graph{prediction}.png')
+best_tft.plot_prediction(raw_predictions.x, raw_predictions.output, idx=0, add_loss_to_title=True,).savefig(f'./data/jaeb_t1d/predictions/tft/graph{prediction}.png')
 
 interpretation = best_tft.interpret_output(raw_predictions.output, reduction="sum")
 interpretations = 0
 interpretations_dict = best_tft.plot_interpretation(interpretation)
 for graph in interpretations_dict:
-    interpretations_dict[graph].savefig(f'./data/normal/predictions/tft/interpretation{interpretations}.png')
+    interpretations_dict[graph].savefig(f'./data/jaeb_t1d/predictions/tft/interpretation{interpretations}.png')
     interpretations+=1
 

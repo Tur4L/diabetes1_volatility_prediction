@@ -231,15 +231,15 @@ def test_errors(preds, actuals, axis=None):
     """
 
     preds = tf.convert_to_tensor(preds, dtype=tf.float32)
-    actuals = tf.convert_to_tensor(
-        actuals, dtype=tf.float32)
+    actuals = tf.convert_to_tensor(actuals, dtype=tf.float32)
+    mape_fn = tf.keras.losses.MeanAbsolutePercentageError()
+
 
     t_MAE = tf.keras.losses.MAE(preds, actuals).numpy()
     t_gMAE = gMAE(preds, actuals, axis=axis).numpy()
     t_RMSE = tf.sqrt(tf.reduce_mean(
         tf.square(tf.subtract(preds, actuals)), axis=axis)).numpy()
-    t_MAPE = tf.keras.losses.mean_absolute_percentage_error(
-        preds, actuals).numpy()
+    t_MAPE = mape_fn(preds, actuals).numpy()
     t_gRMSE = gRMSE(preds, actuals, axis=axis).numpy()
     t_MARD = MARD(preds, actuals, axis=axis).numpy()
     t_gMARD = gMARD(preds, actuals, axis=axis).numpy()
@@ -250,52 +250,47 @@ def test_errors(preds, actuals, axis=None):
 def find_confidence_errors_w_intervals(preds, actuals):
     """
     Find errors and confidence intervals of predictions vs actuals.
+
     Parameters
     ----------
     preds : 1D or 2D numpy array
         Example: [14,10,12] or [[14],[10],[12]]
         Numpy array of glucose predictions.
     actuals: 1D or 2D array
-       Numpy array of glucose predictions.
+       Numpy array of glucose actual values.
 
     Returns
     -------
     errors: list of lists
-        return a list of lists of errors and intervals
-        ex: {[1.4,0.04]..}
-
+        Return a list of lists of errors and confidence intervals
+        ex: [[MAE, MAE_interval], [gMAE, gMAE_interval], ...]
     """
     interval = 0.90
     preds = np.array([sublist for sublist in preds])
     actuals = np.array([sublist for sublist in actuals])
 
-    # if 1D, convert to 2D
+    # If 1D, convert to 2D
     if len(preds.shape) == 1:
         preds = preds.reshape(-1, 1)
     if len(actuals.shape) == 1:
         actuals = actuals.reshape(-1, 1)
 
-    # provide 1D, return error numbers
+    # provide 1D, return overall error numbers
     t_MAE, t_gMAE, t_RMSE, t_gRMSE, t_MAPE, t_MARD, t_gMARD = test_errors(
         preds.flatten(), actuals.flatten())
 
-    # provide 2D,, return lists of errors
+    # provide 2D, return per-sample errors
     i_MAE, i_gMAE, i_RMSE, i_gRMSE, i_MAPE, i_MARD, i_gMARD = test_errors(
         preds, actuals, axis=1)
-    errors_list = [i_MAE, i_gMAE, i_RMSE, i_gRMSE,
-                   i_MAPE, i_MARD, i_gMARD]
-    errors = [[t_MAE], [t_gMAE], [t_RMSE], [t_gRMSE], [
-        t_MAPE], [t_MARD], [t_gMARD]]
 
-    i = 0
-    # create 90% confidence interval
-    for i, _ in enumerate(errors):
-        i_error = errors_list[i]
-        interval_list = st.norm.interval(alpha=interval,
-                                         loc=np.mean(i_error),
-                                         scale=st.sem(i_error))
-        confidence = interval_list[1] - interval_list[0]
+    errors_list = [i_MAE, i_gMAE, i_RMSE, i_gRMSE, i_MAPE, i_MARD, i_gMARD]
+    errors = [[t_MAE], [t_gMAE], [t_RMSE], [t_gRMSE], [t_MAPE], [t_MARD], [t_gMARD]]
+
+    for i, i_error in enumerate(errors_list):
+        ci_low, ci_high = st.norm.interval(confidence=interval, loc=np.mean(i_error), scale=st.sem(i_error))
+        confidence = ci_high - ci_low
         errors[i].append(confidence)
+
     return errors
 
 def lstm_data(df, window_size):
@@ -315,8 +310,8 @@ def lstm_data(df, window_size):
 
     """
 
-    counts = df.groupby(['PtID']).size()
-    label_data = df['Value'].to_numpy()
+    counts = df.groupby(['id']).size()
+    label_data = df['glucose mmol/l'].to_numpy()
     input_data = df.to_numpy()
     frequencies = counts.to_numpy()
     X = {}
@@ -374,15 +369,15 @@ def transformer_data(df, encoder_length, prediction_length):
 
     """
     tft_ptid_list = []
-    grouped_df = df.groupby(['PtID'])
+    grouped_df = df.groupby(['id'])
 
     for ptID, group_data in grouped_df:
         if group_data.size >= encoder_length + prediction_length:
             tft_ptid_list.append(ptID[0])
 
-    df['time_idx'] = df.groupby('PtID').cumcount()
-    tft_df = df[df['PtID'].isin(tft_ptid_list)]
-    tft_df = tft_df.drop(['DeviceTm','T1DBioFamily','T1DBioFamParent','T1DBioFamSibling','T1DBioFamChild','T1DBioFamUnk'], axis=1)
-    tft_df.to_csv('./data/normal/db_tft.csv', index= False)
+    df['time_idx'] = df.groupby('id').cumcount()
+    tft_df = df[df['id'].isin(tft_ptid_list)]
+    tft_df = tft_df.drop(['timestamp'], axis=1)
+    # tft_df.to_csv('./data/normal/db_tft.csv', index= False)
 
     return tft_df
