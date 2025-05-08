@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
-from scipy.stats import ttest_ind, mannwhitneyu, shapiro
+from scipy.stats import ttest_ind, mannwhitneyu, shapiro, kruskal, spearmanr
+from itertools import combinations
 import seaborn as sns
 import random
 import warnings
@@ -11,11 +12,12 @@ import os
 from itx_package import ITXData
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=DeprecationWarning)
 scaler = MinMaxScaler()
 itx_dataloader = ITXData()
 
 DATASET_CONFIG = {
-    "cloud": {"csv_folder": "./data/cloud", "preprocess": "preprocess_cloud"},
+    # "cloud": {"csv_folder": "./data/cloud", "preprocess": "preprocess_cloud"},
     "clvr": {"csv_folder": "./data/clvr", "preprocess": "preprocess_clvr"},
     "defend": {'csv_folder': './data/defend', "preprocess": 'preprocess_defend'},
     "diagnode": {"csv_folder": "./data/diagnode", "preprocess": "preprocess_diagnode"},
@@ -30,12 +32,13 @@ class DataAnalysis:
         """Initializes and loads all datasets dynamically."""
         self.datasets = {}
         self.datasets_summary = {}
+        self.analyzed_datasets = {}
         self.load_data()
 
     def load_data(self): 
         """Loads, cleans, and normalizes all datasets from CSV files."""
 
-        print('\n\tLoading datasets...')
+        print('\n\tLoading, summarizing, and analyzing datasets...')
         for dataset_name, config in DATASET_CONFIG.items():
             csv_folder = config["csv_folder"]
             if not os.path.exists(csv_folder):
@@ -46,6 +49,16 @@ class DataAnalysis:
             df, df_summary = self._preprocess_data(csv_folder, config["preprocess"])
             self.datasets[dataset_name] = df
             self.datasets_summary[dataset_name] = df_summary
+            print('Loading and Summary Done.')
+
+            if os.path.exists(f'{csv_folder}/df_analysis.csv'):
+                df_analysis = pd.read_csv(f'{csv_folder}/df_analysis.csv')
+
+            else:
+                df_analysis = self.statistical_analysis(csv_folder, df)
+
+            self.analyzed_datasets[dataset_name] = df_analysis
+            print('Analysis Done.\n')
 
         print('\tLoading Done.\n')
         
@@ -82,22 +95,55 @@ class DataAnalysis:
         df_age.drop_duplicates(subset=['RecID','id'], inplace=True)
         df_age.sort_values(by=['id'], ascending=True, inplace=True)
         df_age.dropna(subset=['age'], inplace=True)
+        df_randdt = df_age[['id', 'RandDt']]
+        df_randdt.loc[:, 'RandDt'] = pd.to_datetime(df_age['RandDt'], format="%m/%d/%Y %I:%M:%S %p", errors ='coerce')
         df_age = df_age[['id', 'age']]
         df_age.to_csv(f'{csv_folder}/df_age.csv', index=False)
 
-        df_hba1c = pd.read_csv(f'{csv_folder}/original/CloudDiabLocalHbA1c.txt', sep="|")
-        df_hba1c.rename(columns={'PtID':'id', 'Visit':'visit'}, inplace=True)
-        df_hba1c['HbA1cTestDt'] = pd.to_datetime(df_hba1c['HbA1cTestDt'])
-        df_hba1c.sort_values(by=['id','HbA1cTestDt'], ascending=True, inplace=True)
-        df_hba1c.drop_duplicates(subset=['RecID','id'], inplace=True)
-        df_hba1c.dropna(subset=['HbA1cTestRes'], inplace=True)
-        df_hba1c = df_hba1c[['id','visit','HbA1cTestDt', 'HbA1cTestRes']]
-        df_hba1c.to_csv(f'{csv_folder}/df_hba1c.csv',index=False)
+        df_hba1c_local = pd.read_csv(f'{csv_folder}/original/CloudDiabLocalHbA1c.txt', sep="|")
+        df_hba1c_local.rename(columns={'PtID':'id', 'Visit':'visit', 'HbA1cTestRes': 'hb_a1c_local'}, inplace=True)
+        df_hba1c_local['HbA1cTestDt'] = pd.to_datetime(df_hba1c_local['HbA1cTestDt'])
+        df_hba1c_local.sort_values(by=['id','HbA1cTestDt'], ascending=True, inplace=True)
+        df_hba1c_local.drop_duplicates(subset=['RecID','id'], inplace=True)
+        df_hba1c_local.dropna(subset=['hb_a1c_local'], inplace=True)
+        df_hba1c_local = df_hba1c_local[['id','visit','HbA1cTestDt', 'hb_a1c_local']]
+        df_hba1c_local.to_csv(f'{csv_folder}/df_hba1c_local.csv',index=False)
 
+        df_hba1c_cap = pd.read_csv(f'{csv_folder}/original/CloudLabDataHbA1cCap.txt', sep="|")
+        df_hba1c_cap.rename(columns={'PtID':'id', 'Visit':'visit'}, inplace=True)
+        df_hba1c_cap = df_hba1c_cap[~df_hba1c_cap['VisitCollected'].isin(['Visit15', 'Visit17'])]
+        df_hba1c_cap = pd.merge(df_hba1c_cap, df_randdt, on=['id'])
+        df_hba1c_cap['MonthsOffset'] = (df_hba1c_cap['VisitCollected'].str.extract(r'(\d+)').fillna(0).astype(int))
+        df_hba1c_cap['VisitDate'] = df_hba1c_cap.apply(lambda row: row['RandDt'] + pd.DateOffset(months=row['MonthsOffset']), axis=1)
+        df_hba1c_cap['VisitDate'] = pd.to_datetime(df_hba1c_cap['VisitDate'])
+        df_hba1c_cap['hb_a1c_cap'] = (df_hba1c_cap['HbA1cMMol'] + 2.152)/ 10.929
+        df_hba1c_cap.sort_values(by=['id','VisitDate'], ascending=True, inplace=True)
+        df_hba1c_cap = df_hba1c_cap[['id', 'VisitCollected', 'VisitDate', 'hb_a1c_cap']]
+        df_hba1c_cap.dropna(subset=['VisitDate'], inplace=True)
+        df_hba1c_cap.to_csv(f'{csv_folder}/df_hba1c_cap.csv',index=False)
+        cap_ids = df_hba1c_cap['id'].unique()
+
+        df_hba1c_ven = pd.read_csv(f'{csv_folder}/original/CloudLabDataHbA1cVen.txt', sep="|")
+        df_hba1c_ven.rename(columns={'PtID':'id', 'Visit':'visit'}, inplace=True)
+        df_hba1c_ven = df_hba1c_ven[~df_hba1c_ven['VisitCollected'].isin(['Visit15', 'Visit17'])]
+        df_hba1c_ven = pd.merge(df_hba1c_ven, df_randdt, on=['id'])
+        df_hba1c_ven['MonthsOffset'] = (df_hba1c_ven['VisitCollected'].str.extract(r'(\d+)').fillna(0).astype(int))
+        df_hba1c_ven['VisitDate'] = df_hba1c_ven.apply(lambda row: row['RandDt'] + pd.DateOffset(months=row['MonthsOffset']), axis=1)
+        df_hba1c_ven['VisitDate'] = pd.to_datetime(df_hba1c_ven['VisitDate'])
+        df_hba1c_ven['hb_a1c_ven'] = (df_hba1c_ven['HbA1cMMol'] + 2.152)/ 10.929
+        df_hba1c_ven.sort_values(by=['id','VisitDate'], ascending=True, inplace=True)
+        df_hba1c_ven = df_hba1c_ven[['id', 'VisitCollected','VisitDate', 'hb_a1c_ven']]
+        df_hba1c_ven.dropna(subset=['VisitDate'], inplace=True)
+        df_hba1c_ven.to_csv(f'{csv_folder}/df_hba1c_ven.csv',index=False)
+        
         df_cpep = pd.read_csv(f'{csv_folder}/original/CloudLabCPeptide.txt', sep="|")
         df_cpep.rename(columns={'PtID':'id', 'Height':'height', 'Weight':'weight'}, inplace=True)
         df_cpep.drop_duplicates(subset=['RecID','id'], inplace=True)
-        df_cpep.sort_values(by=['id'], ascending=True, inplace=True)
+        df_cpep.dropna(subset='CPeptide10Min', inplace=True)
+        df_cpep.loc[df_cpep['VisitCollected'] == 'Baseline', 'VisitCollected'] = '0 Months'
+        df_cpep['VisitMonth'] = df_cpep['VisitCollected'].str.extract(r'(\d+)').astype(float)
+        df_cpep.sort_values(by=['id','VisitMonth'], ascending=True, inplace=True)
+        df_cpep = df_cpep[['id', 'VisitCollected', 'VisitMonth', 'CPeptide0Min', 'CPeptide10Min', 'CPeptide15Min', 'CPeptide30Min', 'CPeptide60Min', 'CPeptide90Min', 'CPeptide120Min']]
         df_cpep.to_csv(f'{csv_folder}/df_cpep.csv', index=False)
 
         df_screening = pd.read_csv(f'{csv_folder}/original/CloudMMTTProced.txt', sep="|")
@@ -108,7 +154,7 @@ class DataAnalysis:
         df_screening.dropna(subset=['height'], inplace=True)
         df_screening = df_screening[['id','visit','height','weight']]
         df_screening.to_csv(f'{csv_folder}/df_screening.csv', index=False)
-        df_avg = df_screening.groupby("id")[["height", "weight"]].mean().reset_index()
+        df_screening = df_screening.groupby("id")[["height", "weight"]].mean().reset_index()
 
         df_demographic = pd.read_csv(f'{csv_folder}/original/CloudRecruitment.txt', sep="|")
         df_demographic.rename(columns={'PtID':'id', 'Sex':'sex', 'Ethnicity':'ethnicity', 'Race':'race'}, inplace=True)
@@ -118,11 +164,29 @@ class DataAnalysis:
         df_demographic['sex'] = df_demographic['sex'].map({'M': 0, 'F': 1})
         df_demographic.to_csv(f'{csv_folder}/df_demographic.csv', index=False)
 
-        df_final = pd.merge(df_cgm, df_age, on=['id'], how='inner')
-        df_final = df_final.merge(df_avg, on='id', how='inner')
+        df_final = df_cgm.copy()
+        df_final = self.create_3_month_time_bins(df_final)
+        df_final = df_final[['id','timestamp', 'time_bins', 'timestamp_seconds', 'glucose mmol/l']]
+        df_final['VisitMonth_final'] = df_final['time_bins'].str.extract(r'(\d+)').astype(float)
+
+        df_final = df_final.merge(df_age, on=['id'], how='inner')
+        df_final = df_final.merge(df_screening, on='id', how='inner')
         df_final = df_final.merge(df_demographic, on='id', how='inner')
 
-        df_final['hb_a1c'] = 0
+        common_ids = set(df_hba1c_cap['id']) & set(df_hba1c_ven['id']) & set(df_final['id']) & set(df_hba1c_local['id']) & set(df_cpep['id'])
+        df_final = df_final[df_final['id'].isin(common_ids)].sort_values(by=['timestamp']).reset_index(drop=True)
+        df_hba1c_cap = df_hba1c_cap[df_hba1c_cap['id'].isin(common_ids)].sort_values(by=['VisitDate']).reset_index(drop=True)
+        df_hba1c_ven = df_hba1c_ven[df_hba1c_ven['id'].isin(common_ids)].sort_values(by=['VisitDate']).reset_index(drop=True)
+        df_hba1c_local = df_hba1c_local[df_hba1c_local['id'].isin(common_ids)].sort_values(by='HbA1cTestDt').reset_index(drop=True)
+        df_cpep = df_cpep[df_cpep['id'].isin(common_ids)].sort_values(by='VisitMonth').reset_index(drop=True)
+
+        df_final = pd.merge_asof(df_final, df_hba1c_cap, by='id', left_on='timestamp', right_on='VisitDate', direction='nearest')
+        df_final = pd.merge_asof(df_final, df_hba1c_ven, by='id', left_on='timestamp', right_on='VisitDate', direction='nearest')
+        df_final = pd.merge_asof(df_final, df_hba1c_local, by='id', left_on='timestamp', right_on='HbA1cTestDt', direction='nearest')
+        df_final = df_final.sort_values(by=['VisitMonth_final']).reset_index(drop=True)
+        df_final = pd.merge_asof(df_final, df_cpep, by='id', left_on='VisitMonth_final', right_on='VisitMonth', direction='nearest')
+        df_final = df_final.sort_values(by=['id', 'timestamp']).reset_index(drop=True)
+        df_final.drop(columns=['VisitCollected_x','VisitDate_x','VisitCollected_y', 'VisitDate_y','HbA1cTestDt', 'VisitMonth_final', 'VisitMonth', 'VisitCollected'], inplace=True)
         df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
         '''Data info'''
@@ -192,8 +256,24 @@ class DataAnalysis:
         df_screening = df_screening[['id','visit','height','weight', 'age']]
         df_screening.to_csv(f'{csv_folder}/df_screening.csv', index=False)
 
-        df_final = pd.merge(df_cgm, df_screening, on=['id', 'visit'], how='inner')
-        df_final = pd.merge(df_final, df_demographic, on=['id'], how='inner')
+        df_mmtt = pd.read_csv(f'{csv_folder}/original/mmttResults.txt', sep="|")
+        df_mmtt.rename(columns={'PtID':'id', 'Visit': 'visit'}, inplace=True)
+        df_mmtt = df_mmtt.pivot(index=['id', 'visit', 'CollectionDt'], columns='ResultName', values='Value').reset_index()
+        df_mmtt['CollectionDt'] = pd.to_datetime(df_mmtt['CollectionDt'], format = "%d%b%Y")
+        df_mmtt.to_csv(f'{csv_folder}/df_mmtt.csv', index=False)
+
+        df_final = df_cgm.copy()
+        df_final = self.create_3_month_time_bins(df_final)
+        df_final = df_final[['id','timestamp', 'time_bins', 'visit', 'timestamp_seconds', 'glucose mmol/l']]
+
+        df_final = df_final.merge(df_screening, on=['id', 'visit'], how='inner')
+        df_final = df_final.merge(df_demographic, on=['id'], how='inner')
+
+        common_ids = set(df_mmtt['id']) & set(df_final['id'])
+        df_final = df_final[df_final['id'].isin(common_ids)].sort_values(by=['timestamp']).reset_index(drop=True)
+        df_mmtt = df_mmtt[df_final['id'].isin(common_ids)].sort_values(by=['CollectionDt']).reset_index(drop=True)
+        df_final = pd.merge_asof(df_final, df_mmtt, by='id', left_on='timestamp', right_on='CollectionDt', direction='nearest')
+
         df_final['hb_a1c'] = 0
 
         df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
@@ -235,6 +315,7 @@ class DataAnalysis:
         df_cgm = pd.read_csv(f'{csv_folder}/original/defend_2.csv')
         df_cgm.rename(columns={'usubjid':'id', 'sensorglucose':'glucose mmol/l'}, inplace=True)
         df_cgm['timestamp'] = pd.to_datetime(df_cgm['timestamp'], format="%Y-%m-%dT%H:%M:%SZ")
+        df_cgm.sort_values(by=['id','timestamp'], ascending=True, inplace=True)
         df_cgm['timestamp_seconds'] = df_cgm.groupby('id')['timestamp'].transform(
             lambda x: (x - x.min()).dt.total_seconds() if not x.isnull().all() else np.nan)
         
@@ -248,6 +329,7 @@ class DataAnalysis:
         df_final['weight'] = 0
         df_final['height'] = 0
         df_final['hb_a1c'] = 0
+        df_final = self.create_3_month_time_bins(df_final)
         df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
         '''Data info'''
@@ -313,6 +395,7 @@ class DataAnalysis:
         df_final = pd.merge(df_cgm, df_aljc, on=['id','visit'], how='inner')
         df_final = df_final[['id','timestamp','timestamp_seconds','glucose mmol/l', 'scaled_glucose', 'age', 'weight', 'height', 'sex', 'hb_a1c']]
         df_final['sex'] = df_final['sex'].map({'Male': 0, 'Female': 1})
+        df_final = self.create_3_month_time_bins(df_final)
         df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
 
@@ -353,6 +436,7 @@ class DataAnalysis:
         df_cgm = pd.read_csv(f'{csv_folder}/original/gskalb.csv')
         df_cgm.rename(columns={'usubjid':'id', 'sensorglucose':'glucose mmol/l'}, inplace=True)
         df_cgm['timestamp'] = pd.to_datetime(df_cgm['timestamp'], format="%Y-%m-%dT%H:%M:%SZ")
+        df_cgm.sort_values(by=['id','timestamp'], ascending=True, inplace=True)
         df_cgm['timestamp_seconds'] = df_cgm.groupby('id')['timestamp'].transform(
             lambda x: (x - x.min()).dt.total_seconds() if not x.isnull().all() else np.nan)
         
@@ -366,6 +450,7 @@ class DataAnalysis:
         df_final['weight'] = 0
         df_final['height'] = 0
         df_final['hb_a1c'] = 0
+        df_final = self.create_3_month_time_bins(df_final)
         df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
         '''Data info'''
@@ -400,6 +485,7 @@ class DataAnalysis:
         """Custom preprocessing for Islet Transplant dataset"""
         df_cgm = itx_dataloader.get_cgm_data()
         df_final = itx_dataloader.get_final_data()
+        df_final = self.create_3_month_time_bins(df_final)
         df_cgm.to_csv(f'{csv_folder}/df_cgm.csv', index=False)
         df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
@@ -485,6 +571,7 @@ class DataAnalysis:
         df_final.rename(columns={'DeviceTm':'timestamp', 'Value':'glucose mmol/l', 'AgeAsOfEnrollDt':'age',
                                 'Weight':'weight', 'Height':'height', 'HbA1c':'hb_a1c', 'PtID': 'id', 'Gender': 'sex'}, inplace=True)
         df_final = df_final[['id','timestamp','timestamp_seconds','glucose mmol/l', 'scaled_glucose', 'age', 'weight', 'height', 'sex', 'hb_a1c']]
+        df_final = self.create_3_month_time_bins(df_final)
         df_final.to_csv('./data/jaeb_healthy/df_final.csv',index=False)
 
         '''Data info'''
@@ -522,6 +609,7 @@ class DataAnalysis:
         df_cgm = pd.read_csv(f'{csv_folder}/original/2025-03-13_T1D_JAEB_C-path_CGM_clean.csv')
         df_cgm.rename(columns={'PtID':'id','DeviceTm': 'timestamp', 'Value' : 'glucose mmol/l'}, inplace=True)
         df_cgm['timestamp'] = pd.to_datetime(df_cgm['timestamp'])
+        df_cgm.sort_values(by=['id','timestamp'], ascending=True, inplace=True)
         df_cgm['timestamp_seconds'] = df_cgm.groupby('id')['timestamp'].transform(
             lambda x: (x - x.min()).dt.total_seconds() if not x.isnull().all() else np.nan)
         
@@ -532,6 +620,7 @@ class DataAnalysis:
         df_final['weight'] = 0
         df_final['height'] = 0
         df_final['hb_a1c'] = 0
+        df_final = self.create_3_month_time_bins(df_final)
         df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
         '''Data info'''
@@ -562,6 +651,103 @@ class DataAnalysis:
         
         return df_final, df_summary
 
+    def create_3_month_time_bins(self, df):
+        df_time_bin = df.copy()
+        df_grouped_time_bin = df_time_bin.groupby('id')
+
+        all_patients = []
+
+        for pt_id, pt_df in df_grouped_time_bin:
+            pt_df['time_bins'] = 'N/A'
+            pt_df['timestamp'] = pd.to_datetime(pt_df['timestamp'])
+            start = pt_df['timestamp'].min()
+            max_time = pt_df['timestamp'].max()
+            months = 0
+
+            while start < max_time:
+                if months == 0:
+                    end = start + pd.DateOffset(months=2, weeks=3)
+                else:
+                    end = start + pd.DateOffset(months=3)
+
+                mask = (pt_df['timestamp'] >= start) & (pt_df['timestamp'] < end)
+                pt_df.loc[mask, 'time_bins'] = f'Months {months}'
+                start = end
+                months+=3
+        
+            all_patients.append(pt_df)
+
+        return pd.concat(all_patients, ignore_index=True)
+    
+    def hypoglycemia_rates(self, df):
+        df = df.copy()
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df_hypo_level_1 = df[(df['glucose mmol/l'] < 3.9) & (df['glucose mmol/l'] >= 3.0)]
+        df_hypo_level_2 = df[df['glucose mmol/l'] < 3.0]
+
+        level_1 = df_hypo_level_1.shape[0]
+        level_2 = df_hypo_level_2.shape[0]
+    
+        median_time_interval = (df['timestamp'].diff().median()).seconds / 60
+        if median_time_interval < 6:
+            df_clinically_significant = df.iloc[::3].reset_index(drop=True)
+        else:
+            df_clinically_significant = df
+        
+        event_start = False
+        num_events = 0
+        for i in range(df_clinically_significant.shape[0]-1):
+            current_glucose = df_clinically_significant.iloc[i]['glucose mmol/l']
+            next_glucose = df_clinically_significant.iloc[i+1]['glucose mmol/l']
+            current_time = df_clinically_significant.iloc[i]['timestamp']
+            next_time = df_clinically_significant.iloc[i+1]['timestamp']
+            time_diff = (next_time - current_time).total_seconds()/60
+
+            if time_diff < 16:
+                if current_glucose < 3.0:
+                    if next_glucose < 3.0:
+                        event_start = True
+
+                if event_start:
+                    if current_glucose > 3.9:
+                        if next_glucose > 3.9:
+                            event_start = False
+                            num_events += 1
+
+            else:
+                if event_start:
+                    event_start = False
+                    if next_glucose > 3.9:
+                        num_events += 1
+
+        return level_1, level_2, num_events
+    
+    def hypoglycemia_rates_std_cv(self, df_analysis):
+        '''Returns standard deviation and coefficient variation of hypoglycemia rates'''
+        hypo_level_1_mean = df_analysis['hypoglycemia_level_1'].mean()
+        hypo_level_1_std = df_analysis['hypoglycemia_level_1'].std()
+        hypo_level_1_cv = hypo_level_1_std/hypo_level_1_mean * 100
+
+        hypo_level_2_mean = df_analysis['hypoglycemia_level_2'].mean()
+        hypo_level_2_std = df_analysis['hypoglycemia_level_2'].std()
+        hypo_level_2_cv = hypo_level_2_std/hypo_level_2_mean * 100
+
+        cl_sig_hypo_mean = df_analysis['cl_sig_hypo'].mean()
+        cl_sig_hypo_std = df_analysis['cl_sig_hypo'].std()
+        cl_sig_hypo_cv = cl_sig_hypo_std/cl_sig_hypo_mean * 100
+
+        return {
+            'hypo_level_1_mean' : hypo_level_1_mean,
+            'hypo_level_1_std' : hypo_level_1_std,
+            'hypo_level_1_cv' : hypo_level_1_cv,
+            'hypo_level_2_mean' : hypo_level_2_mean,
+            'hypo_level_2_std' : hypo_level_2_std,
+            'hypo_level_2_cv' : hypo_level_2_cv,
+            'cl_sg_hypo_mean' : cl_sig_hypo_mean,
+            'cl_sig_hypo_std' : cl_sig_hypo_std,
+            'cl_sig_hypo_cv' : cl_sig_hypo_cv
+        }
+    
     def get_dataset(self, name):
         '''Retrieves a dataset by name.'''
         return self.datasets.get(name, None)
@@ -569,9 +755,9 @@ class DataAnalysis:
     def get_dataset_summary(self, name):
         return self.datasets_summary.get(name, None)
     
-    def get_cgm_core_endpoints(self, df):
+    def get_cgm_core_endpoints_per_group(self, df_group, **kwargs):
         '''
-        Returns core CGM endpoints such as:
+            Returns core CGM endpoints such as:
             Time in range
             Time below range <3.9 mmol/l, including readings of <3.0 mmol/l
             Time below range <3.0 mmol/l
@@ -581,63 +767,56 @@ class DataAnalysis:
             Standard deviation of mean glucose
             Mean sensor glucose
         '''
+        df_group = df_group.copy()
+        df_group['timestamp'] = pd.to_datetime(df_group['timestamp'])
 
+        df_group['time_diff'] = df_group['timestamp'].diff().dt.total_seconds() / 3600
+        median_interval = df_group['time_diff'].median()
+        df_group['time_diff'] = df_group['time_diff'].fillna(median_interval)
+
+        total_time = df_group['time_diff'].sum()
+        mean_glucose = df_group['glucose mmol/l'].mean()
+        std_glucose = df_group['glucose mmol/l'].std()
+
+        if total_time == 0 or mean_glucose == 0:
+            return pd.Series({})
+
+        cv = std_glucose / mean_glucose * 100
+
+        in_range = (df_group['glucose mmol/l'] >= 3.9) & (df_group['glucose mmol/l'] <= 10.0)
+        below_3_9 = df_group['glucose mmol/l'] < 3.9
+        below_3_0 = df_group['glucose mmol/l'] < 3.0
+        above_10 = df_group['glucose mmol/l'] > 10.0
+        above_13_9 = df_group['glucose mmol/l'] > 13.9
+
+        tir = df_group.loc[in_range, 'time_diff'].sum()
+        tbr_1 = df_group.loc[below_3_9, 'time_diff'].sum()
+        tbr_2 = df_group.loc[below_3_0, 'time_diff'].sum()
+        tar_1 = df_group.loc[above_10, 'time_diff'].sum()
+        tar_2 = df_group.loc[above_13_9, 'time_diff'].sum()
+
+        max_wear = (df_group['timestamp'].iloc[-1] - df_group['timestamp'].iloc[0]).total_seconds() / 3600
+        wear_pct = (total_time / max_wear) * 100 if max_wear > 0 else 0
+
+        return pd.Series({
+            'percent_wear_time': wear_pct,
+            'percent_in_range': (tir / total_time) * 100,
+            'percent_tbr_level_1': (tbr_1 / total_time) * 100,
+            'percent_tbr_level_2': (tbr_2 / total_time) * 100,
+            'percent_tar_level_1': (tar_1 / total_time) * 100,
+            'percent_tar_level_2': (tar_2 / total_time) * 100,
+            'mean_glucose': mean_glucose,
+            'std_glucose': std_glucose,
+            'cv_percent': cv
+        })
+    
+    def get_cgm_core_endpoints_general(self, df: pd.DataFrame, **kwargs):
         df_cgm = df.copy()
-        df_cgm = df_cgm[['id','timestamp','glucose mmol/l']]
-
+        df_cgm = df_cgm[['id', 'timestamp', 'glucose mmol/l']]
         df_cgm['timestamp'] = pd.to_datetime(df_cgm['timestamp'])
-        df_grouped_cgm = df_cgm.groupby('id')
-        results = {}
 
-        for ptid, df_pt_cgm in df_grouped_cgm:
-            df_pt_cgm['time_diff'] = df_pt_cgm['timestamp'].diff().dt.total_seconds()/3600
-            median_interval = df_pt_cgm['time_diff'].median()
-            df_pt_cgm['time_diff'] = df_pt_cgm['time_diff'].fillna(median_interval)
+        return pd.DataFrame(df_cgm.groupby(['id'], group_keys=False).apply(self.get_cgm_core_endpoints_per_group, include_group=False))
 
-            total_time = df_pt_cgm['time_diff'].sum()
-            
-            in_range = (df_pt_cgm['glucose mmol/l'] >= 3.9) & (df_pt_cgm['glucose mmol/l'] <= 10.0)
-            in_hypo_level_1_range = (df_pt_cgm['glucose mmol/l'] < 3.9)
-            in_hypo_level_2_range = (df_pt_cgm['glucose mmol/l'] < 3.0)
-            in_hyper_level_1_range = (df_pt_cgm['glucose mmol/l'] > 10.0)
-            in_hyper_level_2_range = (df_pt_cgm['glucose mmol/l'] > 13.9)
-
-            time_in_range = df_pt_cgm.loc[in_range, 'time_diff'].sum()
-            time_below_range_level_1 = df_pt_cgm.loc[in_hypo_level_1_range, 'time_diff'].sum()
-            time_below_range_level_2 = df_pt_cgm.loc[in_hypo_level_2_range, 'time_diff'].sum()
-            time_above_range_level_1 = df_pt_cgm.loc[in_hyper_level_1_range, 'time_diff'].sum()
-            time_above_range_level_2 = df_pt_cgm.loc[in_hyper_level_2_range, 'time_diff'].sum()
-
-            mean_glucose = df_pt_cgm['glucose mmol/l'].mean()
-            std_glucose = df_pt_cgm['glucose mmol/l'].std()
-            cv_glucose = std_glucose / mean_glucose * 100
-
-            max_wear_time = (df_pt_cgm['timestamp'].iloc[-1] - df_pt_cgm['timestamp'].iloc[0]).total_seconds() / 3600
-            percent_wear_time = (total_time/max_wear_time) * 100
-
-            results_pt = {
-                'percent_wear_time' : percent_wear_time,
-                'time_in_range_hours' : time_in_range,
-                'percent_in_range' : time_in_range/total_time * 100,
-                'time_below_range_level_1' : time_below_range_level_1,
-                'percent_tbr_level_1' : time_below_range_level_1/total_time * 100,
-                'time_below_range_level_2' : time_below_range_level_2,
-                'percent_tbr_level_2' : time_below_range_level_2/total_time * 100,
-                'time_above_range_level_1' : time_above_range_level_1,
-                'percent_tar_level_1' : time_above_range_level_1/total_time * 100,
-                'time_above_range_level_2' : time_above_range_level_2,
-                'percent_tar_level_2' : time_above_range_level_2/total_time * 100,
-                'mean_glucose' : mean_glucose,
-                'std_glucose' : std_glucose,
-                'cv_percent' : cv_glucose
-            }
-
-            results[ptid] = results_pt
-
-        df_results = pd.DataFrame.from_dict(results, orient='index').reset_index(names='id')
-        df_results = df_results.sort_values(by='id')
-
-        return df_results
     
     def get_cgm_avg_core_endpoints(self, df_results):
 
@@ -713,78 +892,79 @@ class DataAnalysis:
         total_distance_t += total_distance_i
         total_time_t += total_time_i
 
-        return total_distance_t, total_distance_t/max(total_time_t,1)
-    
-    def hypoglycemia_rates(self, df):
-        df = df.copy()
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df_hypo_level_1 = df[(df['glucose mmol/l'] < 3.9) & (df['glucose mmol/l'] >= 3.0)]
-        df_hypo_level_2 = df[df['glucose mmol/l'] < 3.0]
+        return total_time_t, total_distance_t, total_distance_t/max(total_time_t,1)
 
-        level_1 = df_hypo_level_1.shape[0]
-        level_2 = df_hypo_level_2.shape[0]
-    
-        median_time_interval = (df['timestamp'].diff().median()).seconds / 60
-        if median_time_interval < 6:
-            df_clinically_significant = df.iloc[::3].reset_index(drop=True)
-        else:
-            df_clinically_significant = df
+    def plot_hypothesis_test_general(self, df_healthy, df_t1d, feature_name, test_results, path):
+        '''Plots distributions of the given feature for healthy vs a T1D group'''
+        df_healthy_plot = df_healthy.copy()
+        df_t1d_plot = df_t1d.copy()
+
+        df_healthy_plot['group'] = 'Healthy'
+        df_t1d_plot['group'] = "T1D" #Change this for the T1D group
+        df_plot = pd.concat([df_healthy_plot,df_t1d_plot])
+
+        plt.figure(figsize=(8,5))
+        sns.boxplot(x='group', y=feature_name, data=df_plot)
+
+        p_value = test_results['p_value']
+        plt.title(f'{feature_name} Comparision\n{test_results['test_used']} | p = {p_value:.3g}')
+
+        plt.ylabel(feature_name)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(path) #Change this for the T1D group
+        plt.close()
+
+    def plot_hypothesis_test_time_bins(self, df, feature, p_kruskal, rho_spearman, p_spearman, path):
+        full_time_bin_order = [
+            'Months_0', 'Months_3', 'Months_6', 'Months_9',
+            'Months_12', 'Months_15', 'Months_18', 'Months_21', 'Healthy'
+        ]
+        df = df[df['time_bins'] != 'N/A']
+        time_bin_order = [b for b in full_time_bin_order if b in df['time_bins'].unique()]
+        missing_bins = [b for b in full_time_bin_order if b not in df['time_bins'].unique()]
+        # if missing_bins:
+        #     print(f"⚠️ Skipping bins not present in data: {missing_bins}")
+
+        plt.figure(figsize=(10, 6))
+        sns.boxplot(x='time_bins', y=feature, data=df, order=time_bin_order, showfliers=True)
+        sns.stripplot(x='time_bins', y=feature, data=df, order=time_bin_order, color='black', alpha=0.4, jitter=True)
+        plt.title(f"{feature}\nKruskal p={p_kruskal:.4f}, Spearman ρ={rho_spearman:.2f} (p={p_spearman:.4f})", fontsize=13)
+        plt.ylabel(feature)
+        plt.xlabel('Time Bin')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(path)
+        plt.close()
         
-        event_start = False
-        num_events = 0
-        for i in range(df_clinically_significant.shape[0]-1):
-            current_glucose = df_clinically_significant.iloc[i]['glucose mmol/l']
-            next_glucose = df_clinically_significant.iloc[i+1]['glucose mmol/l']
-            current_time = df_clinically_significant.iloc[i]['timestamp']
-            next_time = df_clinically_significant.iloc[i+1]['timestamp']
-            time_diff = (next_time - current_time).total_seconds()/60
+    def plot_analyzed_features_general(self, feature_name):
+        '''Plots distribution of given feature for all groups together'''
+        plot_dict_df = self.analyzed_datasets.copy()
+        df_plot = pd.DataFrame([])
 
-            if time_diff < 16:
-                if current_glucose < 3.0:
-                    if next_glucose < 3.0:
-                        event_start = True
+        for df_name, df in plot_dict_df.items():
+            df['group'] = df_name
+            df_plot = pd.concat([df_plot, df])
 
-                if event_start:
-                    if current_glucose > 3.9:
-                        if next_glucose > 3.9:
-                            event_start = False
-                            num_events += 1
-
-            else:
-                if event_start:
-                    event_start = False
-                    if next_glucose > 3.9:
-                        num_events += 1
-
-        return level_1, level_2, num_events
+        plt.figure(figsize=(8,5))
+        sns.boxplot(x='group', y= feature_name, data=df_plot)
+        plt.title(f'{feature_name} Comparision')
+        plt.ylabel(feature_name)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f'./data/feature_analysis/general/{feature_name}_analysis.png')
+        plt.close()
     
-    def hypoglycemia_rates_std_cv(self, df_analysis):
-        '''Returns standard deviation and coefficient variation of hypoglycemia rates'''
-        hypo_level_1_mean = df_analysis['hypoglycemia_level_1'].mean()
-        hypo_level_1_std = df_analysis['hypoglycemia_level_1'].std()
-        hypo_level_1_cv = hypo_level_1_std/hypo_level_1_mean * 100
+    """Feature analysis methods"""
 
-        hypo_level_2_mean = df_analysis['hypoglycemia_level_2'].mean()
-        hypo_level_2_std = df_analysis['hypoglycemia_level_2'].std()
-        hypo_level_2_cv = hypo_level_2_std/hypo_level_2_mean * 100
+    def print_summaries(self):
+        '''Prints out summaries of available datasets'''
+        for df_name, df_summary in self.datasets_summary.items():
+            print(f'\n{df_name} Summary:')
+            for summary_feature, feature_value in df_summary.items():
+                print(f'\t{summary_feature}: {feature_value}')
 
-        cl_sig_hypo_mean = df_analysis['cl_sig_hypo'].mean()
-        cl_sig_hypo_std = df_analysis['cl_sig_hypo'].std()
-        cl_sig_hypo_cv = cl_sig_hypo_std/cl_sig_hypo_mean * 100
-
-        return {
-            'hypo_level_1_mean' : hypo_level_1_mean,
-            'hypo_level_1_std' : hypo_level_1_std,
-            'hypo_level_1_cv' : hypo_level_1_cv,
-            'hypo_level_2_mean' : hypo_level_2_mean,
-            'hypo_level_2_std' : hypo_level_2_std,
-            'hypo_level_2_cv' : hypo_level_2_cv,
-            'cl_sg_hypo_mean' : cl_sig_hypo_mean,
-            'cl_sig_hypo_std' : cl_sig_hypo_std,
-            'cl_sig_hypo_cv' : cl_sig_hypo_cv
-        }
-    
-    def statystical_analysis(self, csv_folder, df):
+    def statistical_analysis(self, csv_folder, df):
         df = df.copy()
         grouped_patients = df.groupby('id')
     
@@ -796,11 +976,15 @@ class DataAnalysis:
         patients_analysis['hypoglycemia_level_1'] = []
         patients_analysis['hypoglycemia_level_2'] = []
         patients_analysis['cl_sig_hypo'] = []
+        patients_analysis['prc_hypoglycemia_level_1'] = []
+        patients_analysis['prc_hypoglycemia_level_2'] = []
+        patients_analysis['prc_cl_sig_hypo'] = []
 
-        for patient_id, patient_db in grouped_patients:
-            length, norm_length = self.length_data(patient_db)
-            level_1, level_2, cl_sig_events = self.hypoglycemia_rates(patient_db)
-            glucose_avg = patient_db['glucose mmol/l'].mean()
+        for patient_id, patient_df in grouped_patients:
+            # num_cgm_data = patient_df.shape[0]
+            total_time, length, norm_length = self.length_data(patient_df)
+            level_1, level_2, cl_sig_events = self.hypoglycemia_rates(patient_df)
+            glucose_avg = patient_df['glucose mmol/l'].mean()
 
             patients_analysis['id'].append(patient_id)
             patients_analysis['glucose_avg'].append(glucose_avg)
@@ -809,13 +993,47 @@ class DataAnalysis:
             patients_analysis['hypoglycemia_level_1'].append(level_1)
             patients_analysis['hypoglycemia_level_2'].append(level_2)
             patients_analysis['cl_sig_hypo'].append(cl_sig_events)
+            patients_analysis['prc_hypoglycemia_level_1'].append(level_1/total_time * 100) 
+            patients_analysis['prc_hypoglycemia_level_2'].append(level_2/total_time * 100)
+            patients_analysis['prc_cl_sig_hypo'].append(cl_sig_events/total_time * 100)
 
         df_patients_analysis = pd.DataFrame(patients_analysis)
         df_patients_analysis = df_patients_analysis.loc[:, ~df_patients_analysis.columns.duplicated()]
         df_patients_analysis.to_csv(f'{csv_folder}/df_analysis.csv', index=False)
 
         return df_patients_analysis
+    
+    def kruskal_across_time_bins(self, df, feature):
+        groups = [group[feature].dropna().values for name, group in df.groupby('time_bins')]
+        stat, p_value = kruskal(*groups)
+        return stat, p_value
+    
+    def spearman_trend(self, df, feature, bin_order):
+        df = df.copy()
+        df['time_index'] = df['time_bins'].map(bin_order)
+        rho, p_value = spearmanr(df['time_index'], df[feature])
+        return rho, p_value
+    
+    def pairwise_bin_tests(self, df, feature, alpha=0.05):
+        results = []
+        bins = df['time_bins'].dropna().unique()
+        
+        for b1, b2 in combinations(bins, 2):
+            v1 = pd.to_numeric(df[df['time_bins'] == b1][feature], errors='coerce').dropna()
+            v2 = pd.to_numeric(df[df['time_bins'] == b2][feature], errors='coerce').dropna()
 
+            if len(v1) < 2 or len(v2) < 2:
+                continue  # Skip if not enough data to test
+
+            stat, p = mannwhitneyu(v1, v2, alternative='two-sided')
+            results.append({
+                'bin_1': b1,
+                'bin_2': b2,
+                'p_value': p,
+                'significant': p < alpha
+            })
+        return pd.DataFrame(results)
+    
     def hypothesis_test(self, df_healthy, df_t1d, feature_name, alpha = 0.05):
         '''This is used to find if there is significant differnece between healthy and t1d features'''
 
@@ -851,28 +1069,62 @@ class DataAnalysis:
             "normality_t1d": normal_t1d
         }
     
-    def plot_hypothesis_test(self, df_healthy, df_t1d, feature_name, test_results, path):
-        '''Plots distributions of the given feature for healthy vs T1D groups'''
-        df_healthy_plot = df_healthy.copy()
-        df_t1d_plot = df_t1d.copy()
+    def hypothesis_test_LoL(self):
+        '''Hypothesis test of Length of Line'''
+        analyzed_datasets_t1d_dict = self.analyzed_datasets.copy()
+        analyzed_datasets_t1d_dict.pop('jaeb_healthy')
+        df_analyzed_healthy = self.analyzed_datasets['jaeb_healthy']
 
-        df_healthy_plot['group'] = 'Healthy'
-        df_t1d_plot['group'] = "T1D" #Change this for the T1D group
-        df_plot = pd.concat([df_healthy_plot,df_t1d_plot])
+        for df_name, df_analyzed_t1d in analyzed_datasets_t1d_dict.items():
+            hypo_test_results = self.hypothesis_test(df_analyzed_healthy, df_analyzed_t1d, feature_name='normalized_length')
+            self.plot_hypothesis_test_general(df_analyzed_healthy, df_analyzed_t1d, 'normalized_length', hypo_test_results, f'./data/feature_analysis/general/LoL/jh_vs_{df_name}.png')   
 
-        plt.figure(figsize=(8,5))
-        sns.boxplot(x='group', y=feature_name, data=df_plot)
+    def hypothesis_test_CGM_core_endpoints_general(self):
+        '''Hypothesis test of CGM Core Endpoints in total time'''
+        dict_df_t1d = self.datasets.copy()
+        dict_df_t1d.pop('jaeb_healthy')
+        df_jaeb_healthy = self.datasets['jaeb_healthy']
+        jaeb_healthy_core_endpoints = self.get_cgm_core_endpoints_general(df_jaeb_healthy)
 
-        p_value = test_results['p_value']
-        plt.title(f'{feature_name} Comparision\n{test_results['test_used']} | p = {p_value:.3g}')
+        for df_name, df_t1d in dict_df_t1d.items():
+            t1d_core_endpoints = self.get_cgm_core_endpoints_general(df_t1d)
+            for core_endpoints_feature in jaeb_healthy_core_endpoints.columns.drop('id'):
+                hypo_test_results = self.hypothesis_test(jaeb_healthy_core_endpoints, t1d_core_endpoints, core_endpoints_feature)
+                self.plot_hypothesis_test_general(jaeb_healthy_core_endpoints, t1d_core_endpoints, core_endpoints_feature, hypo_test_results, f'./data/feature_analysis/general/{core_endpoints_feature}/jh_vs_{df_name}.png')
 
-        plt.ylabel(feature_name)
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(path) #Change this for the T1D group
-        plt.close()
-        
-    
+    def hypothesis_test_CGM_core_endpoints_time_bins(self):
+        dict_df_t1d = self.datasets.copy()
+        dict_df_t1d.pop('jaeb_healthy')
+        df_jaeb_healthy = self.datasets['jaeb_healthy'].copy()
+        jaeb_healthy_core_endpoints = self.get_cgm_core_endpoints_general(df_jaeb_healthy).reset_index()
+        jaeb_healthy_core_endpoints['time_bins'] = 'Healthy'
+        jaeb_healthy_core_endpoints['id'] = 'Healthy_' + jaeb_healthy_core_endpoints['id'].astype('str')
+        jaeb_healthy_core_endpoints.to_csv('./healthy.csv', index=False)
+
+        bin_order = {
+            'Healthy': -1,
+            'Months_0': 0,
+            'Months_3': 1,
+            'Months_6': 2,
+            'Months_9': 3,
+            'Months_12': 4,
+            'Months_15': 5,
+            'Months_18': 6,
+            'Months_21': 7,
+}
+
+
+        for df_name, df_t1d in dict_df_t1d.items():
+            df_t1d.sort_values(by=['time_bins'])
+            df_t1d = df_t1d[~(df_t1d['time_bins'] == 'N/A')]
+            df_time_bins = df_t1d.groupby(['time_bins']).apply(self.get_cgm_core_endpoints_general, include_group=False).reset_index()
+            df_time_bins = pd.concat([df_time_bins, jaeb_healthy_core_endpoints], ignore_index=True)
+            for core_endpoints_feature in jaeb_healthy_core_endpoints.columns.drop(['id','time_bins']):
+                stat, p_kruskal = self.kruskal_across_time_bins(df_time_bins, core_endpoints_feature)
+                rho, p_spearman = self.spearman_trend(df_time_bins, core_endpoints_feature, bin_order)
+                pairwise_results = self.pairwise_bin_tests(df_time_bins, core_endpoints_feature)
+                self.plot_hypothesis_test_time_bins(df_time_bins, core_endpoints_feature,p_kruskal,rho, p_spearman, path=f'./data/feature_analysis/time_bins/{core_endpoints_feature}/jh_vs_{df_name}.png')
+
 if __name__ == '__main__':
     data_analysis = DataAnalysis()
 
@@ -885,156 +1137,25 @@ if __name__ == '__main__':
     df_jaeb_healthy = data_analysis.get_dataset('jaeb_healthy')
     df_jaeb_t1d = data_analysis.get_dataset('jaeb_t1d')
 
-    '''Printing dataset summaries'''
-    print('CLOUD dataset summary:')
-    print(data_analysis.get_dataset_summary('cloud'))
-    print()
+    # '''Printing dataset summaries'''
+    # data_analysis.print_summaries()
 
-    print('CLVR dataset summary:')
-    print(data_analysis.get_dataset_summary('clvr'))
-    print()
+    # '''Hypoglycemia rates statistics '''
+    # # hypo_rate_statistics = data_analysis.hypoglycemia_rates_std_cv(df_diagnode)
+    # # print(hypo_rate_statistics)
 
-    print('DEFEND-2 dataset summary:')
-    print(data_analysis.get_dataset_summary('defend'))
-    print()
+    # '''Hypothesis test: Length of Line'''
+    # data_analysis.hypothesis_test_LoL()
 
-    print('Diagnode dataset summary:')
-    print(data_analysis.get_dataset_summary('diagnode'))
-    print()
+    '''Hypothesis test: CGM core endpoints GENERAL'''
+    data_analysis.hypothesis_test_CGM_core_endpoints_general()
 
-    print('GSKALB dataset summary:')
-    print(data_analysis.get_dataset_summary('gskalb'))
-    print()
+    # '''Hypothesis test: CGM core endpoints TIME BINS'''
+    # data_analysis.hypothesis_test_CGM_core_endpoints_time_bins()
 
-    print('Islet transplant dataset summary:')
-    print(data_analysis.get_dataset_summary('itx'))
-    print()
+    # '''Boxplot hypoglycemia rates'''
+    # data_analysis.plot_analyzed_features_general('prc_hypoglycemia_level_1')
+    # data_analysis.plot_analyzed_features_general('prc_hypoglycemia_level_2')
+    # data_analysis.plot_analyzed_features_general('prc_cl_sig_hypo')
 
-    print('JAEB Healthy dataset summary:')
-    print(data_analysis.get_dataset_summary('jaeb_healthy'))
-    print()
-
-    print('JAEB T1D dataset summary:')
-    print(data_analysis.get_dataset_summary('jaeb_t1d'))
-    print()
-
-    '''Analyze datasets'''
-    # If not analyzed before
-    # analyzed_cloud = data_analysis.statystical_analysis('./data/cloud', df_cloud)
-    # analyzed_clvr = data_analysis.statystical_analysis('./data/clvr', df_clvr)
-    # analyzed_defend = data_analysis.statystical_analysis('./data/defend', df_defend)
-    # analyzed_diagnode = data_analysis.statystical_analysis('./data/diagnode', df_diagnode)
-    # analyzed_gskalb = data_analysis.statystical_analysis('./data/gskalb', df_gskalb)
-    # analyzed_itx = data_analysis.statystical_analysis('./data/itx', df_itx)
-    # analyzed_jaeb_healthy = data_analysis.statystical_analysis('./data/jaeb_healthy', df_clvr)
-    # analyzed_jaeb_t1d = data_analysis.statystical_analysis('./data/jaeb_t1d', df_jaeb_t1d)
-
-    #If analyzed before
-    analyzed_cloud = pd.read_csv('./data/cloud/df_analysis.csv')
-    analyzed_clvr = pd.read_csv('./data/clvr/df_analysis.csv')
-    analyzed_defend = pd.read_csv('./data/defend/df_analysis.csv')
-    analyzed_diagnode = pd.read_csv('./data/diagnode/df_analysis.csv')
-    analyzed_gskalb = pd.read_csv('./data/gskalb/df_analysis.csv')
-    analyzed_itx = pd.read_csv('./data/itx/df_analysis.csv')
-    analyzed_jaeb_healthy = pd.read_csv('./data/jaeb_healthy/df_analysis.csv')
-    analyzed_jaeb_t1d = pd.read_csv('./data/jaeb_t1d/df_analysis.csv')
-
-    '''Hypoglycemia rates statistics '''
-    # hypo_rate_statistics = data_analysis.hypoglycemia_rates_std_cv(df_diagnode)
-    # print(hypo_rate_statistics)
-
-    '''Get core endpoints '''
-    cloud_core_endpoints = data_analysis.get_cgm_core_endpoints(df_cloud)
-    clvr_core_endpoints = data_analysis.get_cgm_core_endpoints(df_clvr)
-    defend_core_endpoints = data_analysis.get_cgm_core_endpoints(df_defend)
-    diagnode_core_endpoints = data_analysis.get_cgm_core_endpoints(df_diagnode)
-    gskalb_core_endpoints = data_analysis.get_cgm_core_endpoints(df_gskalb)
-    itx_core_endpoints = data_analysis.get_cgm_core_endpoints(df_itx)
-    jaeb_healthy_core_endpoints = data_analysis.get_cgm_core_endpoints(df_jaeb_healthy)
-    jaeb_t1d_core_endpoints = data_analysis.get_cgm_core_endpoints(df_jaeb_t1d)
-
-    '''Get Avg Core Endpoints '''
-    #TODO: Fix for DataFrames
-    # cloud_avg_core_endpoints = data_analysis.get_cgm_avg_core_endpoints(cloud_core_endpoints)
-    # clvr_avg_core_endpoints = data_analysis.get_cgm_avg_core_endpoints(clvr_core_endpoints)
-    # defend_avg_core_endpoints = data_analysis.get_cgm_avg_core_endpoints(defend_core_endpoints)
-    # diagnode_avg_core_endpoints = data_analysis.get_cgm_avg_core_endpoints(diagnode_core_endpoints)
-    # gskalb_avg_core_endpoints = data_analysis.get_cgm_avg_core_endpoints(gskalb_core_endpoints)
-    # itx_avg_core_endpoints = data_analysis.get_cgm_avg_core_endpoints(itx_core_endpoints)
-    # jaeb_healthy_avg_core_endpoints = data_analysis.get_cgm_avg_core_endpoints(jaeb_healthy_core_endpoints)
-    # jaeb_t1d_avg_core_endpoints = data_analysis.get_cgm_avg_core_endpoints(jaeb_t1d_core_endpoints)
-
-    # print(itx_avg_core_endpoints)
-
-    '''Hypothesis test: Length of Line'''
-    #Hypothesis test CLOUD vs JAEB Healthy LoL
-    hypo_test_results = data_analysis.hypothesis_test(analyzed_jaeb_healthy, analyzed_cloud, 'normalized_length')
-    data_analysis.plot_hypothesis_test(analyzed_jaeb_healthy, analyzed_cloud, 'normalized_length', hypo_test_results, './data/feature_analysis/LoL/jh_vs_cloud.png')
-    print('\nCLOUD vs JAEB Healthy LoL:')
-    print(hypo_test_results)
-
-    #Hypothesis test CLVR vs JAEB Healthy LoL
-    hypo_test_results = data_analysis.hypothesis_test(analyzed_jaeb_healthy, analyzed_clvr, 'normalized_length')
-    data_analysis.plot_hypothesis_test(analyzed_jaeb_healthy, analyzed_clvr, 'normalized_length', hypo_test_results, './data/feature_analysis/LoL/jh_vs_clvr.png')
-    print('\nCLVR vs JAEB Healthy LoL:')
-    print(hypo_test_results)
-
-    #Hypothesis test DEFEND-2 vs JAEB Healthy LoL
-    hypo_test_results = data_analysis.hypothesis_test(analyzed_jaeb_healthy, analyzed_defend, 'normalized_length')
-    data_analysis.plot_hypothesis_test(analyzed_jaeb_healthy, analyzed_defend, 'normalized_length', hypo_test_results, './data/feature_analysis/LoL/jh_vs_defend.png')
-    print('\nDEFEND-2 vs JAEB Healthy LoL:')
-    print(hypo_test_results)
-
-    #Hypothesis test JAEB T1D vs JAEB Healthy LoL
-    hypo_test_results = data_analysis.hypothesis_test(analyzed_jaeb_healthy, analyzed_jaeb_t1d, 'normalized_length')
-    data_analysis.plot_hypothesis_test(analyzed_jaeb_healthy, analyzed_jaeb_t1d, 'normalized_length', hypo_test_results, './data/feature_analysis/LoL/jh_vs_jt1d.png')
-    print('\nJAEB T1D vs JAEB Healthy LoL:')
-    print(hypo_test_results)
-
-    #Hypothesis test Diagnode vs JAEB Healthy LoL
-    hypo_test_results = data_analysis.hypothesis_test(analyzed_jaeb_healthy, analyzed_diagnode, 'normalized_length')
-    data_analysis.plot_hypothesis_test(analyzed_jaeb_healthy, analyzed_diagnode, 'normalized_length', hypo_test_results, './data/feature_analysis/LoL/jh_vs_diagnode.png')
-    print('\nDiagnode vs JAEB Healthy LoL:')
-    print(hypo_test_results)
-
-    #Hypothesis test GSKALB vs JAEB Healthy LoL
-    hypo_test_results = data_analysis.hypothesis_test(analyzed_jaeb_healthy, analyzed_gskalb, 'normalized_length')
-    data_analysis.plot_hypothesis_test(analyzed_jaeb_healthy, analyzed_gskalb, 'normalized_length', hypo_test_results, './data/feature_analysis/LoL/jh_vs_gskalb.png')
-    print('\nGSKALB vs JAEB Healthy LoL:')
-    print(hypo_test_results)
-
-    #Hypothesis test iTX vs JAEB Healthy LoL
-    hypo_test_results = data_analysis.hypothesis_test(analyzed_jaeb_healthy, analyzed_itx, 'normalized_length')
-    data_analysis.plot_hypothesis_test(analyzed_jaeb_healthy, analyzed_itx, 'normalized_length', hypo_test_results, './data/feature_analysis/LoL/jh_vs_itx.png')
-    print('\niTX vs JAEB Healthy LoL:')
-    print(hypo_test_results)
-
-    '''Hypothesis test: CGM core endpoints'''
-    for core_endpoints_feature in jaeb_healthy_core_endpoints.columns.drop('id'):
-        #Hypothesis test CLOUD vs JAEB Healthy Average CGM core endpoints
-        hypo_test_results = data_analysis.hypothesis_test(jaeb_healthy_core_endpoints, cloud_core_endpoints, core_endpoints_feature)
-        data_analysis.plot_hypothesis_test(jaeb_healthy_core_endpoints, cloud_core_endpoints, core_endpoints_feature, hypo_test_results, f'./data/feature_analysis/{core_endpoints_feature}/jh_vs_cloud.png')
-        
-        #Hypothesis test CLVR vs JAEB Healthy Average CGM core endpoints 
-        hypo_test_results = data_analysis.hypothesis_test(jaeb_healthy_core_endpoints, clvr_core_endpoints, core_endpoints_feature)
-        data_analysis.plot_hypothesis_test(jaeb_healthy_core_endpoints, clvr_core_endpoints, core_endpoints_feature, hypo_test_results, f'./data/feature_analysis/{core_endpoints_feature}/jh_vs_clvr.png')
-
-        #Hypothesis test DEFEND-2 vs JAEB Healthy Average CGM core endpoints 
-        hypo_test_results = data_analysis.hypothesis_test(jaeb_healthy_core_endpoints, defend_core_endpoints, core_endpoints_feature)
-        data_analysis.plot_hypothesis_test(jaeb_healthy_core_endpoints, defend_core_endpoints, core_endpoints_feature, hypo_test_results, f'./data/feature_analysis/{core_endpoints_feature}/jh_vs_defend.png')
-        
-        #Hypothesis test JAEB T1D vs JAEB Healthy Average CGM core endpoints
-        hypo_test_results = data_analysis.hypothesis_test(jaeb_healthy_core_endpoints, jaeb_t1d_core_endpoints, core_endpoints_feature)
-        data_analysis.plot_hypothesis_test(jaeb_healthy_core_endpoints, jaeb_t1d_core_endpoints, core_endpoints_feature, hypo_test_results, f'./data/feature_analysis/{core_endpoints_feature}/jh_vs_jt1d.png')
-    
-        #Hypothesis test Diagnode vs JAEB Healthy Average CGM core endpoints
-        hypo_test_results = data_analysis.hypothesis_test(jaeb_healthy_core_endpoints, diagnode_core_endpoints, core_endpoints_feature)
-        data_analysis.plot_hypothesis_test(jaeb_healthy_core_endpoints, diagnode_core_endpoints, core_endpoints_feature, hypo_test_results, f'./data/feature_analysis/{core_endpoints_feature}/jh_vs_diagnode.png')
-
-        #Hypothesis test GSKALB vs JAEB Healthy Average CGM core endpoints 
-        hypo_test_results = data_analysis.hypothesis_test(jaeb_healthy_core_endpoints, gskalb_core_endpoints, core_endpoints_feature)
-        data_analysis.plot_hypothesis_test(jaeb_healthy_core_endpoints, gskalb_core_endpoints, core_endpoints_feature, hypo_test_results, f'./data/feature_analysis/{core_endpoints_feature}/jh_vs_gskalb.png')
-        
-        #Hypothesis test iTX vs JAEB Healthy Average CGM core endpoints
-        hypo_test_results = data_analysis.hypothesis_test(jaeb_healthy_core_endpoints, itx_core_endpoints, core_endpoints_feature)
-        data_analysis.plot_hypothesis_test(jaeb_healthy_core_endpoints, itx_core_endpoints, core_endpoints_feature, hypo_test_results, f'./data/feature_analysis/{core_endpoints_feature}/jh_vs_itx.png')    #If analyzed before
+    # data_analysis.get_cgm_core_endpoints_general(df_jaeb_healthy).reset_index().to_csv('./healthy.csv', index=False)
