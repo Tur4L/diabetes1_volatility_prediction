@@ -17,7 +17,7 @@ scaler = MinMaxScaler()
 itx_dataloader = ITXData()
 
 DATASET_CONFIG = {
-    # "cloud": {"csv_folder": "./data/cloud", "preprocess": "preprocess_cloud"},
+    "cloud": {"csv_folder": "./data/cloud", "preprocess": "preprocess_cloud"},
     "clvr": {"csv_folder": "./data/clvr", "preprocess": "preprocess_clvr"},
     "defend": {'csv_folder': './data/defend', "preprocess": 'preprocess_defend'},
     "diagnode": {"csv_folder": "./data/diagnode", "preprocess": "preprocess_diagnode"},
@@ -46,7 +46,17 @@ class DataAnalysis:
                 continue
 
             print(f"Loading {dataset_name} from {csv_folder}...")
+
+            # if os.path.exists(f'{csv_folder}/df_final.csv') and os.path.exists(f'{csv_folder}/df_summary.csv'):
+            #     df = pd.read_csv(f'{csv_folder}/df_final.csv')
+            #     df_summary = pd.read_csv(f'{csv_folder}/df_summary.csv')
+
+            # else: 
             df, df_summary = self._preprocess_data(csv_folder, config["preprocess"])
+            df.to_csv(f'{csv_folder}/df_final.csv', index=False)
+            df_summary.to_csv(f'{csv_folder}/df_summary.csv', index=False)
+                
+
             self.datasets[dataset_name] = df
             self.datasets_summary[dataset_name] = df_summary
             print('Loading and Summary Done.')
@@ -137,13 +147,16 @@ class DataAnalysis:
         df_hba1c_ven.to_csv(f'{csv_folder}/df_hba1c_ven.csv',index=False)
         
         df_cpep = pd.read_csv(f'{csv_folder}/original/CloudLabCPeptide.txt', sep="|")
-        df_cpep.rename(columns={'PtID':'id', 'Height':'height', 'Weight':'weight'}, inplace=True)
+        df_cpep.rename(columns={'PtID':'id', 'Height':'height', 'Weight':'weight', 'CPeptide0Min': 'cpep_0_min',
+                                'CPeptide10Min': 'cpep_10_min', 'CPeptide15Min': 'cpep_15_min', 'CPeptide30Min': 'cpep_30_min',
+                                'CPeptide60Min': 'cpep_60_min', 'CPeptide90Min': 'cpep_90_min', 'CPeptide120Min': 'cpep_120_min'}, inplace=True)
         df_cpep.drop_duplicates(subset=['RecID','id'], inplace=True)
-        df_cpep.dropna(subset='CPeptide10Min', inplace=True)
+        df_cpep.dropna(subset='cpep_10_min', inplace=True)
         df_cpep.loc[df_cpep['VisitCollected'] == 'Baseline', 'VisitCollected'] = '0 Months'
         df_cpep['VisitMonth'] = df_cpep['VisitCollected'].str.extract(r'(\d+)').astype(float)
         df_cpep.sort_values(by=['id','VisitMonth'], ascending=True, inplace=True)
-        df_cpep = df_cpep[['id', 'VisitCollected', 'VisitMonth', 'CPeptide0Min', 'CPeptide10Min', 'CPeptide15Min', 'CPeptide30Min', 'CPeptide60Min', 'CPeptide90Min', 'CPeptide120Min']]
+        df_cpep = df_cpep[['id', 'VisitCollected', 'VisitMonth', 'cpep_0_min', 'cpep_10_min', 'cpep_15_min', 'cpep_30_min',
+                            'cpep_60_min', 'cpep_90_min', 'cpep_120_min']]
         df_cpep.to_csv(f'{csv_folder}/df_cpep.csv', index=False)
 
         df_screening = pd.read_csv(f'{csv_folder}/original/CloudMMTTProced.txt', sep="|")
@@ -187,7 +200,6 @@ class DataAnalysis:
         df_final = pd.merge_asof(df_final, df_cpep, by='id', left_on='VisitMonth_final', right_on='VisitMonth', direction='nearest')
         df_final = df_final.sort_values(by=['id', 'timestamp']).reset_index(drop=True)
         df_final.drop(columns=['VisitCollected_x','VisitDate_x','VisitCollected_y', 'VisitDate_y','HbA1cTestDt', 'VisitMonth_final', 'VisitMonth', 'VisitCollected'], inplace=True)
-        df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
         '''Data info'''
         no_dup_df = df_final.drop_duplicates(subset='id')
@@ -207,19 +219,19 @@ class DataAnalysis:
         beta2_interval = ''
         cgm_interval = '15 minutes'
 
-        df_summary = {'Number of patients':num_people,
-                    'Number of males':num_male,
-                    'Number of females': num_female,
-                    'Minimum age': min_age,
-                    'Maximum age': max_age,
-                    'Number of people < 18 years': num_less_than_18,
-                    'Number of people >= 18 years': num_18_or_older,
-                    'C-Peptide interval': c_peptide_interval,
-                    'BETA2 Score interval': beta2_interval,
-                    'CGM data interval': cgm_interval}
+        df_summary = {'Number of patients': [num_people],
+                    'Number of males':[num_male],
+                    'Number of females': [num_female],
+                    'Minimum age': [min_age],
+                    'Maximum age': [max_age],
+                    'Number of people < 18 years': [num_less_than_18],
+                    'Number of people >= 18 years': [num_18_or_older],
+                    'C-Peptide interval': [c_peptide_interval],
+                    'BETA2 Score interval': [beta2_interval],
+                    'CGM data interval': [cgm_interval]}
         
 
-        return df_final, df_summary
+        return df_final, pd.DataFrame(df_summary)
 
     def preprocess_clvr(self, csv_folder):
         """Custom preprocessing for CLVR dataset."""
@@ -259,7 +271,10 @@ class DataAnalysis:
         df_mmtt = pd.read_csv(f'{csv_folder}/original/mmttResults.txt', sep="|")
         df_mmtt.rename(columns={'PtID':'id', 'Visit': 'visit'}, inplace=True)
         df_mmtt = df_mmtt.pivot(index=['id', 'visit', 'CollectionDt'], columns='ResultName', values='Value').reset_index()
+        df_mmtt.rename(columns={'C-PEP-0': 'cpep_0_min', 'C-PEP-15': 'cpep_15_min', 'C-PEP-30': 'cpep_30_min',
+                                'C-PEP-60': 'cpep_60_min', 'C-PEP-90': 'cpep_90_min', 'C-PEP-120': 'cpep_120_min'}, inplace=True)
         df_mmtt['CollectionDt'] = pd.to_datetime(df_mmtt['CollectionDt'], format = "%d%b%Y")
+        df_mmtt.drop(columns=['GLU-0','GLU-120','GLU-15','GLU-30','GLU-60','GLU-90'], inplace=True, axis=1)
         df_mmtt.to_csv(f'{csv_folder}/df_mmtt.csv', index=False)
 
         df_final = df_cgm.copy()
@@ -274,9 +289,7 @@ class DataAnalysis:
         df_mmtt = df_mmtt[df_final['id'].isin(common_ids)].sort_values(by=['CollectionDt']).reset_index(drop=True)
         df_final = pd.merge_asof(df_final, df_mmtt, by='id', left_on='timestamp', right_on='CollectionDt', direction='nearest')
 
-        df_final['hb_a1c'] = 0
-
-        df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
+        df_final['hb_a1c_local'] = 0
 
         '''Data info'''
         no_dup_df = df_final.drop_duplicates(subset='id')
@@ -296,18 +309,18 @@ class DataAnalysis:
         beta2_interval = ''
         cgm_interval = '5 minutes'
 
-        df_summary = {'Number of patients':num_people,
-                    'Number of males':num_male,
-                    'Number of females': num_female,
-                    'Minimum age': min_age,
-                    'Maximum age': max_age,
-                    'Number of people < 18 years': num_less_than_18,
-                    'Number of people >= 18 years': num_18_or_older,
-                    'C-Peptide interval': c_peptide_interval,
-                    'BETA2 Score interval': beta2_interval,
-                    'CGM data interval': cgm_interval}
+        df_summary = {'Number of patients': [num_people],
+                    'Number of males':[num_male],
+                    'Number of females': [num_female],
+                    'Minimum age': [min_age],
+                    'Maximum age': [max_age],
+                    'Number of people < 18 years': [num_less_than_18],
+                    'Number of people >= 18 years': [num_18_or_older],
+                    'C-Peptide interval': [c_peptide_interval],
+                    'BETA2 Score interval': [beta2_interval],
+                    'CGM data interval': [cgm_interval]}
 
-        return df_final, df_summary
+        return df_final, pd.DataFrame(df_summary)
 
     def preprocess_defend(self, csv_folder):
         """Custom preprocessing for DEFEND-2 dataset."""
@@ -324,13 +337,9 @@ class DataAnalysis:
 
         #TODO: Add other features once i get them
         df_final = df_cgm.copy()
-        df_final['sex'] = 0
-        df_final['age'] = 0
-        df_final['weight'] = 0
-        df_final['height'] = 0
-        df_final['hb_a1c'] = 0
+        df_final[['sex', 'age', 'weight', 'height', 'cpep_0_min', 'cpep_10_min', 'cpep_15_min',
+                  'cpep_30_min', 'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'hb_a1c_local']] = 0
         df_final = self.create_3_month_time_bins(df_final)
-        df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
         '''Data info'''
         num_people = df_final['id'].nunique()
@@ -347,18 +356,18 @@ class DataAnalysis:
         beta2_interval = {'N/A'}
         cgm_interval = {'N/A'}
 
-        df_summary = {'Number of patients':num_people,
-                    'Number of males':num_male,
-                    'Number of females': num_female,
-                    'Minimum age': min_age,
-                    'Maximum age': max_age,
-                    'Number of people < 18 years': num_less_than_18,
-                    'Number of people >= 18 years': num_18_or_older,
-                    'C-Peptide interval': c_peptide_interval,
-                    'BETA2 Score interval': beta2_interval,
-                    'CGM data interval': cgm_interval}
+        df_summary = {'Number of patients': [num_people],
+                    'Number of males':[num_male],
+                    'Number of females': [num_female],
+                    'Minimum age': [min_age],
+                    'Maximum age': [max_age],
+                    'Number of people < 18 years': [num_less_than_18],
+                    'Number of people >= 18 years': [num_18_or_older],
+                    'C-Peptide interval': [c_peptide_interval],
+                    'BETA2 Score interval': [beta2_interval],
+                    'CGM data interval': [cgm_interval]}
         
-        return df_final, df_summary
+        return df_final, pd.DataFrame(df_summary)
     
     def preprocess_diagnode(self, csv_folder):
         """Custom preprocessing for DIAGNODE dataset."""
@@ -388,19 +397,39 @@ class DataAnalysis:
 
         #Extra feature
         df_aljc = pd.read_csv(f'{csv_folder}/original/ALJC_clean_DIAGNODE_analysis_dataset_perch.csv')
-        df_aljc = df_aljc[['id','visit','treatment','sex','weight','height','age','hb_a1c',
-                       'c_peptide_fasting','glucose_fasting']]
+
+        df_screening = df_aljc[['id','visit','treatment','sex','weight','height','age']]
+        df_screening.sort_values(by=['id','visit'], ascending=True, inplace=True)
+        df_screening.dropna(subset=['weight'], inplace=True)
+        df_screening.dropna(subset=['height'], inplace=True)
+        df_screening.to_csv(f'{csv_folder}/df_screening.csv', index=False)
+        
+        df_hba_a1c = df_aljc[['id', 'visit', 'hb_a1c']]
+        df_hba_a1c.rename(columns={'hb_a1c' : 'hb_a1c_local'}, inplace=True)
+        df_hba_a1c.dropna(subset=['hb_a1c_local'], inplace=True)
+        df_hba_a1c.sort_values(by=['id','visit'], ascending=True, inplace=True)
+        df_hba_a1c.to_csv(f'{csv_folder}/df_hba_a1c.csv', index=False)
+
+        df_cpep = df_aljc[['id', 'visit', 'cpep0', 'cpep30', 'cpep60', 'cpep90', 'cpep120']]
+        df_cpep.rename(columns={'cpep0': 'cpep_0_min', 'cpep30': 'cpep_30_min',
+                                'cpep60': 'cpep_60_min', 'cpep90': 'cpep_90_min', 'cpep120': 'cpep_120_min'}, inplace=True)
+        df_cpep.dropna(subset=['cpep_0_min'], inplace=True)
+        df_cpep.sort_values(by=['id','visit'], ascending=True, inplace=True)
+        df_cpep.to_csv(f'{csv_folder}/df_cpep.csv', index=False)
 
         #Merged dataframe
-        df_final = pd.merge(df_cgm, df_aljc, on=['id','visit'], how='inner')
-        df_final = df_final[['id','timestamp','timestamp_seconds','glucose mmol/l', 'scaled_glucose', 'age', 'weight', 'height', 'sex', 'hb_a1c']]
-        df_final['sex'] = df_final['sex'].map({'Male': 0, 'Female': 1})
+        df_final = df_cgm.copy()
         df_final = self.create_3_month_time_bins(df_final)
-        df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
+        df_final = df_final.merge(df_screening, on=['id','visit'], how='inner')
+        df_final = df_final.merge(df_hba_a1c, on=['id','visit'], how='inner')
+        df_final = df_final.merge(df_cpep, on=['id','visit'], how='inner')
 
+        df_final = df_final[['id','timestamp','timestamp_seconds', 'time_bins', 'glucose mmol/l', 'scaled_glucose', 'age', 'weight', 'height', 'sex', 'cpep_0_min', 'cpep_30_min',
+                            'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'hb_a1c_local']]
+        df_final['sex'] = df_final['sex'].map({'Male': 0, 'Female': 1})
 
         '''Data info:'''
-        no_dup_df = df_aljc.drop_duplicates(subset='id')
+        no_dup_df = df_final.drop_duplicates(subset='id')
 
         num_people = no_dup_df.shape[0]
 
@@ -417,18 +446,18 @@ class DataAnalysis:
         beta2_interval = '0-6-15-24 months'
         cgm_interval = '15 minutes'
 
-        df_summary = {'Number of patients':num_people,
-                    'Number of males':num_male,
-                    'Number of females': num_female,
-                    'Minimum age': min_age,
-                    'Maximum age': max_age,
-                    'Number of people < 18 years': num_less_than_18,
-                    'Number of people >= 18 years': num_18_or_older,
-                    'C-Peptide interval': c_peptide_interval,
-                    'BETA2 Score interval': beta2_interval,
-                    'CGM data interval': cgm_interval}
+        df_summary = {'Number of patients': [num_people],
+                    'Number of males':[num_male],
+                    'Number of females': [num_female],
+                    'Minimum age': [min_age],
+                    'Maximum age': [max_age],
+                    'Number of people < 18 years': [num_less_than_18],
+                    'Number of people >= 18 years': [num_18_or_older],
+                    'C-Peptide interval': [c_peptide_interval],
+                    'BETA2 Score interval': [beta2_interval],
+                    'CGM data interval': [cgm_interval]}
         
-        return df_final, df_summary
+        return df_final, pd.DataFrame(df_summary)
     
     def preprocess_gskalb(self, csv_folder):
         """Custom preprocessing for GSKALB dataset."""
@@ -445,13 +474,9 @@ class DataAnalysis:
 
         #TODO: Add other features once i get them
         df_final = df_cgm.copy()
-        df_final['sex'] = 0
-        df_final['age'] = 0
-        df_final['weight'] = 0
-        df_final['height'] = 0
-        df_final['hb_a1c'] = 0
+        df_final[['sex', 'age', 'weight', 'height', 'cpep_0_min', 'cpep_10_min', 'cpep_15_min',
+                  'cpep_30_min', 'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'hb_a1c_local']] = 0
         df_final = self.create_3_month_time_bins(df_final)
-        df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
         '''Data info'''
         num_people = df_final['id'].nunique()
@@ -468,18 +493,18 @@ class DataAnalysis:
         beta2_interval = {'N/A'}
         cgm_interval = {'N/A'}
 
-        df_summary = {'Number of patients':num_people,
-                    'Number of males':num_male,
-                    'Number of females': num_female,
-                    'Minimum age': min_age,
-                    'Maximum age': max_age,
-                    'Number of people < 18 years': num_less_than_18,
-                    'Number of people >= 18 years': num_18_or_older,
-                    'C-Peptide interval': c_peptide_interval,
-                    'BETA2 Score interval': beta2_interval,
-                    'CGM data interval': cgm_interval}
+        df_summary = {'Number of patients': [num_people],
+                    'Number of males':[num_male],
+                    'Number of females': [num_female],
+                    'Minimum age': [min_age],
+                    'Maximum age': [max_age],
+                    'Number of people < 18 years': [num_less_than_18],
+                    'Number of people >= 18 years': [num_18_or_older],
+                    'C-Peptide interval': [c_peptide_interval],
+                    'BETA2 Score interval': [beta2_interval],
+                    'CGM data interval': [cgm_interval]}
         
-        return df_final, df_summary
+        return df_final, pd.DataFrame(df_summary)
 
     def preprocess_itx(self, csv_folder):
         """Custom preprocessing for Islet Transplant dataset"""
@@ -487,7 +512,6 @@ class DataAnalysis:
         df_final = itx_dataloader.get_final_data()
         df_final = self.create_3_month_time_bins(df_final)
         df_cgm.to_csv(f'{csv_folder}/df_cgm.csv', index=False)
-        df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
         '''Data info'''
         no_dup_df = df_final.drop_duplicates(subset='id')
@@ -512,24 +536,25 @@ class DataAnalysis:
                         '6' : '5 minutes',
         }
 
-        df_summary = {'Number of patients':num_people,
-                    'Number of males':num_male,
-                    'Number of females': num_female,
-                    'Minimum age': min_age,
-                    'Maximum age': max_age,
-                    'Number of people < 18 years': num_less_than_18,
-                    'Number of people >= 18 years': num_18_or_older,
-                    'C-Peptide interval': c_peptide_interval,
-                    'BETA2 Score interval': beta2_interval,
-                    'CGM data interval': cgm_interval}
+        df_summary = {'Number of patients': [num_people],
+                    'Number of males':[num_male],
+                    'Number of females': [num_female],
+                    'Minimum age': [min_age],
+                    'Maximum age': [max_age],
+                    'Number of people < 18 years': [num_less_than_18],
+                    'Number of people >= 18 years': [num_18_or_older],
+                    'C-Peptide interval': [c_peptide_interval],
+                    'BETA2 Score interval': [beta2_interval],
+                    'CGM data interval': [cgm_interval]}
 
-        return df_final, df_summary
+        return df_final, pd.DataFrame(df_summary)
 
     def preprocess_jaeb_healthy(self, csv_folder):
         """Custom preprocessing for JAEB healthy dataset."""
 
         #CGM data
         df_cgm = pd.read_csv(f'{csv_folder}/original/NonDiabDeviceCGM.csv')
+        df_cgm.rename(columns={'PtID': 'id'}, inplace=True)
         df_cgm = df_cgm[df_cgm['RecordType'] == 'CGM']
 
         df_cgm['glucose mmol/l'] = df_cgm['Value'] / 18 #Converting mg/dl to mmol/l
@@ -538,7 +563,7 @@ class DataAnalysis:
 
         #Cleaning timestamp
         df_cgm.loc[:, 'timestamp_seconds'] = pd.to_timedelta(df_cgm['DeviceTm']).dt.total_seconds() + df_cgm['DeviceDtDaysFromEnroll'] * 86400
-        df_cgm['time_diff'] = df_cgm.groupby('PtID')['timestamp_seconds'].diff()
+        df_cgm['time_diff'] = df_cgm.groupby('id')['timestamp_seconds'].diff()
 
         initial_date = pd.to_datetime("2024-01-01")
         df_cgm['timestamp'] = initial_date + pd.to_timedelta(df_cgm['DeviceDtDaysFromEnroll'], unit='D')
@@ -553,26 +578,29 @@ class DataAnalysis:
 
         #Adding Age
         df_age = pd.read_csv(f'{csv_folder}/original/NonDiabPtRoster.csv')
-        df_age.drop_duplicates(['RecID', 'PtID'], inplace=True)
-        df_age = df_age[['PtID','AgeAsOfEnrollDt']]
+        df_age.rename(columns={'PtID': 'id'}, inplace=True)        
+        df_age.drop_duplicates(['RecID', 'id'], inplace=True)
+        df_age = df_age[['id','AgeAsOfEnrollDt']]
         df_age.to_csv('./data/jaeb_healthy/df_age.csv', index=False)
 
         #Extra features
         df_screening = pd.read_csv(f'{csv_folder}/original/NonDiabScreening.csv')
-        df_screening.drop_duplicates(['RecID', 'PtID'], inplace=True)
+        df_screening.rename(columns={'PtID': 'id'}, inplace=True)
+        df_screening.drop_duplicates(['RecID', 'id'], inplace=True)
 
-        df_screening = df_screening[['PtID','Weight', 'Height', 'HbA1c', 'Gender', 'Race']]
+        df_screening = df_screening[['id','Weight', 'Height', 'HbA1c', 'Gender', 'Race']]
         df_screening['Gender'] = df_screening['Gender'].map({'M' : 0, 'F': 1})
         df_screening.to_csv(f'{csv_folder}/df_screening.csv', index=False)
 
-        df_final = pd.merge(df_cgm, df_age, on='PtID', how='inner')
-        df_final = pd.merge(df_final, df_screening, on='PtID', how='inner')
-
-        df_final.rename(columns={'DeviceTm':'timestamp', 'Value':'glucose mmol/l', 'AgeAsOfEnrollDt':'age',
-                                'Weight':'weight', 'Height':'height', 'HbA1c':'hb_a1c', 'PtID': 'id', 'Gender': 'sex'}, inplace=True)
-        df_final = df_final[['id','timestamp','timestamp_seconds','glucose mmol/l', 'scaled_glucose', 'age', 'weight', 'height', 'sex', 'hb_a1c']]
+        df_final = df_cgm.copy()
         df_final = self.create_3_month_time_bins(df_final)
-        df_final.to_csv('./data/jaeb_healthy/df_final.csv',index=False)
+        df_final = df_final.merge(df_age, on='id', how='inner')
+        df_final = df_final.merge(df_screening, on='id', how='inner')
+        df_final.rename(columns={'DeviceTm':'timestamp', 'Value':'glucose mmol/l', 'AgeAsOfEnrollDt':'age',
+                                'Weight':'weight', 'Height':'height', 'HbA1c':'hb_a1c_local', 'Gender': 'sex'}, inplace=True)
+        df_final = df_final[['id','timestamp','timestamp_seconds', 'time_bins', 'glucose mmol/l', 'scaled_glucose',
+                             'age', 'weight', 'height', 'sex', 'hb_a1c_local']]
+        df_final[['cpep_0_min', 'cpep_30_min', 'cpep_60_min', 'cpep_90_min', 'cpep_120_min']] = 0
 
         '''Data info'''
         no_dup_df = df_final.copy()
@@ -590,18 +618,18 @@ class DataAnalysis:
         c_peptide_interval = 'N/A'
         beta2_interval = {'N/A'}
         cgm_interval = '5'
-        df_summary = {'Number of patients':num_people,
-                    'Number of males':num_male,
-                    'Number of females': num_female,
-                    'Minimum age': min_age,
-                    'Maximum age': max_age,
-                    'Number of people < 18 years': num_less_than_18,
-                    'Number of people >= 18 years': num_18_or_older,
-                    'C-Peptide interval': c_peptide_interval,
-                    'BETA2 Score interval': beta2_interval,
-                    'CGM data interval': cgm_interval}
+        df_summary = {'Number of patients': [num_people],
+                    'Number of males':[num_male],
+                    'Number of females': [num_female],
+                    'Minimum age': [min_age],
+                    'Maximum age': [max_age],
+                    'Number of people < 18 years': [num_less_than_18],
+                    'Number of people >= 18 years': [num_18_or_older],
+                    'C-Peptide interval': [c_peptide_interval],
+                    'BETA2 Score interval': [beta2_interval],
+                    'CGM data interval': [cgm_interval]}
 
-        return df_final, df_summary
+        return df_final, pd.DataFrame(df_summary)
 
     def preprocess_jaeb_t1d(self, csv_folder):
         '''Custom preprocessing for JABE Type 1 Diabetes Dataset'''
@@ -615,13 +643,9 @@ class DataAnalysis:
         
         #TODO: Add other features once i get them
         df_final = df_cgm.copy()
-        df_final['sex'] = 0
-        df_final['age'] = 0
-        df_final['weight'] = 0
-        df_final['height'] = 0
-        df_final['hb_a1c'] = 0
+        df_final[['sex', 'age', 'weight', 'height', 'cpep_0_min', 'cpep_10_min', 'cpep_15_min',
+                  'cpep_30_min', 'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'hb_a1c_local']] = 0
         df_final = self.create_3_month_time_bins(df_final)
-        df_final.to_csv(f'{csv_folder}/df_final.csv', index=False)
 
         '''Data info'''
         num_people = df_final['id'].nunique()
@@ -638,18 +662,18 @@ class DataAnalysis:
         beta2_interval = {'N/A'}
         cgm_interval = {'N/A'}
 
-        df_summary = {'Number of patients':num_people,
-                    'Number of males':num_male,
-                    'Number of females': num_female,
-                    'Minimum age': min_age,
-                    'Maximum age': max_age,
-                    'Number of people < 18 years': num_less_than_18,
-                    'Number of people >= 18 years': num_18_or_older,
-                    'C-Peptide interval': c_peptide_interval,
-                    'BETA2 Score interval': beta2_interval,
-                    'CGM data interval': cgm_interval}
+        df_summary = {'Number of patients': [num_people],
+                    'Number of males':[num_male],
+                    'Number of females': [num_female],
+                    'Minimum age': [min_age],
+                    'Maximum age': [max_age],
+                    'Number of people < 18 years': [num_less_than_18],
+                    'Number of people >= 18 years': [num_18_or_older],
+                    'C-Peptide interval': [c_peptide_interval],
+                    'BETA2 Score interval': [beta2_interval],
+                    'CGM data interval': [cgm_interval]}
         
-        return df_final, df_summary
+        return df_final, pd.DataFrame(df_summary)
 
     def create_3_month_time_bins(self, df):
         df_time_bin = df.copy()
@@ -779,7 +803,7 @@ class DataAnalysis:
         std_glucose = df_group['glucose mmol/l'].std()
 
         if total_time == 0 or mean_glucose == 0:
-            return pd.Series({})
+            return {}
 
         cv = std_glucose / mean_glucose * 100
 
@@ -798,7 +822,7 @@ class DataAnalysis:
         max_wear = (df_group['timestamp'].iloc[-1] - df_group['timestamp'].iloc[0]).total_seconds() / 3600
         wear_pct = (total_time / max_wear) * 100 if max_wear > 0 else 0
 
-        return pd.Series({
+        return {
             'percent_wear_time': wear_pct,
             'percent_in_range': (tir / total_time) * 100,
             'percent_tbr_level_1': (tbr_1 / total_time) * 100,
@@ -808,16 +832,22 @@ class DataAnalysis:
             'mean_glucose': mean_glucose,
             'std_glucose': std_glucose,
             'cv_percent': cv
-        })
+        }
     
     def get_cgm_core_endpoints_general(self, df: pd.DataFrame, **kwargs):
         df_cgm = df.copy()
         df_cgm = df_cgm[['id', 'timestamp', 'glucose mmol/l']]
         df_cgm['timestamp'] = pd.to_datetime(df_cgm['timestamp'])
 
-        return pd.DataFrame(df_cgm.groupby(['id'], group_keys=False).apply(self.get_cgm_core_endpoints_per_group, include_group=False))
+        core_endpoints = []
+        for pt_id, pt_df in df_cgm.groupby(['id']):
+            core_endpoint = self.get_cgm_core_endpoints_per_group(pt_df)
+            if core_endpoint:  # ensure it's not empty
+                core_endpoint['id'] = pt_id[0]
+                core_endpoints.append(core_endpoint)
 
-    
+        return pd.DataFrame(core_endpoints)
+
     def get_cgm_avg_core_endpoints(self, df_results):
 
         # #TODO: fix for DataFrame
@@ -917,8 +947,8 @@ class DataAnalysis:
 
     def plot_hypothesis_test_time_bins(self, df, feature, p_kruskal, rho_spearman, p_spearman, path):
         full_time_bin_order = [
-            'Months_0', 'Months_3', 'Months_6', 'Months_9',
-            'Months_12', 'Months_15', 'Months_18', 'Months_21', 'Healthy'
+            'Months 0', 'Months 3', 'Months 6', 'Months 9',
+            'Months 12', 'Months 15', 'Months 18', 'Months 21', 'Healthy'
         ]
         df = df[df['time_bins'] != 'N/A']
         time_bin_order = [b for b in full_time_bin_order if b in df['time_bins'].unique()]
@@ -961,8 +991,8 @@ class DataAnalysis:
         '''Prints out summaries of available datasets'''
         for df_name, df_summary in self.datasets_summary.items():
             print(f'\n{df_name} Summary:')
-            for summary_feature, feature_value in df_summary.items():
-                print(f'\t{summary_feature}: {feature_value}')
+            for summary_feature in df_summary.columns:
+                print(f'\t{summary_feature}: {df_summary[summary_feature].values[0]}')
 
     def statistical_analysis(self, csv_folder, df):
         df = df.copy()
@@ -981,7 +1011,7 @@ class DataAnalysis:
         patients_analysis['prc_cl_sig_hypo'] = []
 
         for patient_id, patient_df in grouped_patients:
-            # num_cgm_data = patient_df.shape[0]
+            num_cgm_data = patient_df.shape[0]
             total_time, length, norm_length = self.length_data(patient_df)
             level_1, level_2, cl_sig_events = self.hypoglycemia_rates(patient_df)
             glucose_avg = patient_df['glucose mmol/l'].mean()
@@ -993,9 +1023,9 @@ class DataAnalysis:
             patients_analysis['hypoglycemia_level_1'].append(level_1)
             patients_analysis['hypoglycemia_level_2'].append(level_2)
             patients_analysis['cl_sig_hypo'].append(cl_sig_events)
-            patients_analysis['prc_hypoglycemia_level_1'].append(level_1/total_time * 100) 
-            patients_analysis['prc_hypoglycemia_level_2'].append(level_2/total_time * 100)
-            patients_analysis['prc_cl_sig_hypo'].append(cl_sig_events/total_time * 100)
+            patients_analysis['prc_hypoglycemia_level_1'].append(level_1/num_cgm_data * 100) 
+            patients_analysis['prc_hypoglycemia_level_2'].append(level_2/num_cgm_data * 100)
+            patients_analysis['prc_cl_sig_hypo'].append(cl_sig_events/num_cgm_data * 100)
 
         df_patients_analysis = pd.DataFrame(patients_analysis)
         df_patients_analysis = df_patients_analysis.loc[:, ~df_patients_analysis.columns.duplicated()]
@@ -1011,6 +1041,7 @@ class DataAnalysis:
     def spearman_trend(self, df, feature, bin_order):
         df = df.copy()
         df['time_index'] = df['time_bins'].map(bin_order)
+        df = df[['time_index', feature]].dropna()
         rho, p_value = spearmanr(df['time_index'], df[feature])
         return rho, p_value
     
@@ -1088,7 +1119,7 @@ class DataAnalysis:
 
         for df_name, df_t1d in dict_df_t1d.items():
             t1d_core_endpoints = self.get_cgm_core_endpoints_general(df_t1d)
-            for core_endpoints_feature in jaeb_healthy_core_endpoints.columns.drop('id'):
+            for core_endpoints_feature in jaeb_healthy_core_endpoints.columns:
                 hypo_test_results = self.hypothesis_test(jaeb_healthy_core_endpoints, t1d_core_endpoints, core_endpoints_feature)
                 self.plot_hypothesis_test_general(jaeb_healthy_core_endpoints, t1d_core_endpoints, core_endpoints_feature, hypo_test_results, f'./data/feature_analysis/general/{core_endpoints_feature}/jh_vs_{df_name}.png')
 
@@ -1096,35 +1127,40 @@ class DataAnalysis:
         dict_df_t1d = self.datasets.copy()
         dict_df_t1d.pop('jaeb_healthy')
         df_jaeb_healthy = self.datasets['jaeb_healthy'].copy()
-        jaeb_healthy_core_endpoints = self.get_cgm_core_endpoints_general(df_jaeb_healthy).reset_index()
+        jaeb_healthy_core_endpoints = self.get_cgm_core_endpoints_general(df_jaeb_healthy)
         jaeb_healthy_core_endpoints['time_bins'] = 'Healthy'
         jaeb_healthy_core_endpoints['id'] = 'Healthy_' + jaeb_healthy_core_endpoints['id'].astype('str')
         jaeb_healthy_core_endpoints.to_csv('./healthy.csv', index=False)
 
         bin_order = {
-            'Healthy': -1,
-            'Months_0': 0,
-            'Months_3': 1,
-            'Months_6': 2,
-            'Months_9': 3,
-            'Months_12': 4,
-            'Months_15': 5,
-            'Months_18': 6,
-            'Months_21': 7,
+            'Months 0': 0,
+            'Months 3': 1,
+            'Months 6': 2,
+            'Months 9': 3,
+            'Months 12': 4,
+            'Months 15': 5,
+            'Months 18': 6,
+            'Months 21': 7,
 }
 
 
         for df_name, df_t1d in dict_df_t1d.items():
-            df_t1d.sort_values(by=['time_bins'])
             df_t1d = df_t1d[~(df_t1d['time_bins'] == 'N/A')]
-            df_time_bins = df_t1d.groupby(['time_bins']).apply(self.get_cgm_core_endpoints_general, include_group=False).reset_index()
-            df_time_bins = pd.concat([df_time_bins, jaeb_healthy_core_endpoints], ignore_index=True)
+            df_time_bins = df_t1d.groupby(['time_bins']).apply(self.get_cgm_core_endpoints_general, include_groups = True).reset_index()
+            df_time_bins['months'] = df_time_bins['time_bins'].str.extract(r'(\d+)').fillna(0).astype(int)
+            df_time_bins.sort_values(by=['months'], inplace=True)
+            df_time_bins.to_csv(f'./data/core_endpoints/{df_name}.csv', index=False)
+            print(f'\tResults of {df_name}:')
             for core_endpoints_feature in jaeb_healthy_core_endpoints.columns.drop(['id','time_bins']):
+                df_time_bins = df_time_bins.groupby('time_bins').filter(lambda g: len(g) >= 3)
                 stat, p_kruskal = self.kruskal_across_time_bins(df_time_bins, core_endpoints_feature)
                 rho, p_spearman = self.spearman_trend(df_time_bins, core_endpoints_feature, bin_order)
                 pairwise_results = self.pairwise_bin_tests(df_time_bins, core_endpoints_feature)
+                df_time_bins = pd.concat([df_time_bins, jaeb_healthy_core_endpoints], ignore_index=True)
                 self.plot_hypothesis_test_time_bins(df_time_bins, core_endpoints_feature,p_kruskal,rho, p_spearman, path=f'./data/feature_analysis/time_bins/{core_endpoints_feature}/jh_vs_{df_name}.png')
-
+                print(f'Feature: {core_endpoints_feature}')
+                print(f"Kruskal-Wallis p = {p_kruskal:.10f}")
+                print(f"Spearman ρ = {rho:.2f}, p = {p_spearman:.10f}\n")
 if __name__ == '__main__':
     data_analysis = DataAnalysis()
 
@@ -1137,23 +1173,23 @@ if __name__ == '__main__':
     df_jaeb_healthy = data_analysis.get_dataset('jaeb_healthy')
     df_jaeb_t1d = data_analysis.get_dataset('jaeb_t1d')
 
-    # '''Printing dataset summaries'''
-    # data_analysis.print_summaries()
+    '''Printing dataset summaries'''
+    data_analysis.print_summaries()
 
-    # '''Hypoglycemia rates statistics '''
+    '''Hypoglycemia rates statistics '''
     # # hypo_rate_statistics = data_analysis.hypoglycemia_rates_std_cv(df_diagnode)
     # # print(hypo_rate_statistics)
 
-    # '''Hypothesis test: Length of Line'''
+    '''Hypothesis test: Length of Line'''
     # data_analysis.hypothesis_test_LoL()
 
     '''Hypothesis test: CGM core endpoints GENERAL'''
-    data_analysis.hypothesis_test_CGM_core_endpoints_general()
+    # data_analysis.hypothesis_test_CGM_core_endpoints_general()
 
-    # '''Hypothesis test: CGM core endpoints TIME BINS'''
+    '''Hypothesis test: CGM core endpoints TIME BINS'''
     # data_analysis.hypothesis_test_CGM_core_endpoints_time_bins()
 
-    # '''Boxplot hypoglycemia rates'''
+    '''Boxplot hypoglycemia rates'''
     # data_analysis.plot_analyzed_features_general('prc_hypoglycemia_level_1')
     # data_analysis.plot_analyzed_features_general('prc_hypoglycemia_level_2')
     # data_analysis.plot_analyzed_features_general('prc_cl_sig_hypo')

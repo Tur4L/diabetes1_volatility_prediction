@@ -21,7 +21,8 @@ Overlapping features:
     hbA1C
 
 '''
-overlapping_features = ['id','timestamp', 'glucose mmol/l', 'sex', 'age', 'weight', 'height','hb_a1c']
+overlapping_features = ['id','timestamp', 'time_bins', 'glucose mmol/l', 'sex', 'age', 'weight', 'height', 'cpep_0_min',
+                        'cpep_30_min', 'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'hb_a1c_local']
 
 #Selecting aggregation features
 agg_cloud_data = cloud_data[overlapping_features]
