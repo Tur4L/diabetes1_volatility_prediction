@@ -1,48 +1,67 @@
-import pandas as pd
-import numpy as np
+import dask.dataframe as dd
+import pyarrow as pa
 
-cloud_data = pd.read_csv('./data/cloud/df_final.csv')
-clvr_data = pd.read_csv('./data/clvr/df_final.csv')
-defend_data = pd.read_csv('./data/defend/df_final.csv')
-diagnode_data = pd.read_csv('./data/diagnode/df_final.csv')
-gskalb_data = pd.read_csv('./data/gskalb/df_final.csv')
-islet_tp_data = pd.read_csv('./data/itx/df_final.csv')
-jaeb_t1d_data = pd.read_csv('./data/jaeb_t1d/df_final.csv')
+# Define the datasets and their paths
+input_files = {
+    'cloud': './data/cloud/df_final.parquet',
+    'clvr': './data/clvr/df_final.parquet',
+    'defend': './data/defend/df_final.parquet',
+    'diagnode': './data/diagnode/df_final.parquet',
+    'gskalb': './data/gskalb/df_final.parquet',
+    # 'islet': './data/itx/df_final.parquet',
+    'jaeb_t1d': './data/jaeb_t1d/df_final.parquet'
+}
 
-'''
-Overlapping features:
-    id
-    timestamp/DeviceTM
-    Value
-    Age/AgeAsOfEnrollDt
-    Weight
-    Height
-    Sex
-    hbA1C
+# Columns you want to keep
+columns_to_use = [
+    'id', 'timestamp', 'time_bins', 'glucose mmol/l', 'sex', 'age', 'weight',
+    'height', 'cpep_0_min', 'cpep_30_min', 'cpep_60_min', 'cpep_90_min',
+    'cpep_120_min', 'cpep_auc', 'hb_a1c_local', 'total_ins_dose', 'glucose_0_min',
+    'glucose_30_min', 'glucose_60_min', 'glucose_90_min', 'glucose_120_min', 'beta2_score'
+]
 
-'''
-overlapping_features = ['id','timestamp', 'time_bins', 'glucose mmol/l', 'sex', 'age', 'weight', 'height', 'cpep_0_min',
-                        'cpep_30_min', 'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'hb_a1c_local']
+# Columns that must be float (ensure type consistency)
+numeric_columns = [
+    'weight', 'height', 'cpep_0_min', 'cpep_30_min', 'cpep_60_min',
+    'cpep_90_min', 'cpep_120_min', 'cpep_auc', 'hb_a1c_local', 'total_ins_dose', 'glucose_0_min',
+    'glucose_30_min', 'glucose_60_min', 'glucose_90_min', 'glucose_120_min', 'beta2_score'
+]
 
-#Selecting aggregation features
-agg_cloud_data = cloud_data[overlapping_features]
+# Accumulate cleaned Dask DataFrames here
+dfs = []
 
-agg_clvr_data = clvr_data[overlapping_features]
-agg_clvr_data['id'] = 'clvr_' + agg_clvr_data['id'].astype('str')
+for name, path in input_files.items():
+    print(f"Loading {name} from {path}...")
+    df = dd.read_parquet(path, engine='pyarrow')
 
-agg_defend_data = defend_data[overlapping_features]
+    df = df[columns_to_use]
+    df['id'] = df['id'].astype(str).map(lambda x: f"{name}_{x}", meta=('id', 'str'))
 
-agg_diagnode_data = diagnode_data[overlapping_features]
-agg_diagnode_data.loc[:,'id'] = 'diagnode_' + agg_diagnode_data['id']
+    # Check and print rows with problematic values before type conversion
+    for col in numeric_columns:
+        bad_rows = df[df[col].astype(str).str.contains("<|>|[a-zA-Z]", na=False)]
+        if bad_rows.shape[0].compute() > 0:
+            print(f"\n❗ Problematic values found in dataset '{name}', column '{col}':")
+            print(bad_rows[['id', col]].compute())
 
-agg_gskalb_data = gskalb_data[overlapping_features]
+    # Convert numeric columns to float
+    for col in numeric_columns:
+        df[col] = df[col].astype(float)
 
-agg_islet_tp_data = islet_tp_data[overlapping_features]
-agg_islet_tp_data.loc[:,'id']  = 'islet_' + agg_islet_tp_data['id'].astype('str')
- 
-agg_jaeb_t1d_data = jaeb_t1d_data[overlapping_features]
-agg_jaeb_t1d_data['id']  = 'jaeb_t1d_' + agg_jaeb_t1d_data['id'].astype('str')
+    dfs.append(df)
 
+# Combine all cleaned datasets
+final_ddf = dd.concat(dfs, interleave_partitions=True)
 
-agg_final = pd.concat([agg_cloud_data, agg_clvr_data, agg_defend_data, agg_diagnode_data, agg_gskalb_data, agg_islet_tp_data, agg_jaeb_t1d_data], ignore_index=True)
-agg_final.to_csv('./data/aggregated_data.csv', index=False)
+# Write Parquet (schema inferred from consistent dtypes)
+print("Saving to Parquet...")
+final_ddf.to_parquet(
+    './data/aggregated_data.parquet',
+    write_index=False,
+    engine='pyarrow',
+    overwrite=True
+)
+
+# final_df = dd.read_parquet(f'./data/aggregated_data.parquet')
+# print(final_df.columns)
+# print(final_df.isna().sum().compute())
