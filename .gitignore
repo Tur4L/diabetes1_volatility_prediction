@@ -36,6 +36,8 @@ __pycache__/
 # png files
 *.png
 
+*.t1d_env
+
 # rtf file
 *.rtf
 
@@ -193,3 +195,4 @@ cython_debug/
 #.idea/
 /.vscode
 /.DS_Store
+t1d_env/
