@@ -20,6 +20,9 @@ from hupa_ucm_package import HUPA_UCM_Data
 from data_analysis import DataAnalysis
 
 data_analysis = DataAnalysis()
+def _to_pandas(df_like):
+    return df_like.compute() if hasattr(df_like, 'compute') else df_like.copy()
+
 def get_cpep_auc(row):
     times = [0,15,30,60,90,120]
     cpep_values = [row[f'cpep_{t}_min'] for t in times]        
@@ -38,7 +41,7 @@ df_clvr = data_analysis.get_dataset('clvr')
 df_defend = data_analysis.get_dataset('defend')
 df_diagnode = data_analysis.get_dataset('diagnode')
 df_gskalb = data_analysis.get_dataset('gskalb')
-df_itx = data_analysis.get_dataset('itx')
+# df_itx = data_analysis.get_dataset('itx')
 df_jaeb_healthy = data_analysis.get_dataset('jaeb_healthy')
 df_jaeb_t1d = data_analysis.get_dataset('jaeb_t1d')
 
@@ -1260,7 +1263,7 @@ def testing_jaeb_final():
     
     ''' Number of median CGM days avaialble'''
     visits = ['Baseline', 'Week 6', 'Month 3', 'Month 6', 'Month 9', 'Month 12']
-    cgm_dfs = df_jaeb_t1d[['id', 'timestamp', 'time_bin', 'treatment_arm', 'glucose mmol/l']].compute()
+    cgm_dfs = _to_pandas(df_jaeb_t1d[['id', 'timestamp', 'time_bin', 'treatment_arm', 'glucose mmol/l']])
     for time_bin in visits:
         print('\n',time_bin)
         cgm_df = cgm_dfs[(cgm_dfs['time_bin'] == time_bin)&(cgm_dfs['treatment_arm'] == 'Active')].dropna(subset=['timestamp']).copy()
@@ -1277,8 +1280,8 @@ def testing_jaeb_final():
 
     ''' C-peptide AUC '''
     visits = ['Baseline', 'Week 6', 'Month 3', 'Month 6', 'Month 9', 'Month 12']
-    jaeb_auc = df_jaeb_t1d[['id', 'time_bin', 'dy', 'treatment_arm', 'cpep_0_min', 'cpep_15_min', 'cpep_30_min',
-                            'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'cpep_auc']].compute()
+    jaeb_auc = _to_pandas(df_jaeb_t1d[['id', 'time_bin', 'dy', 'treatment_arm', 'cpep_0_min', 'cpep_15_min', 'cpep_30_min',
+                            'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'cpep_auc']])
     jaeb_auc.loc[jaeb_auc['dy'] < 30 , 'time_bin'] = 'Baseline'
     jaeb_auc.loc[(jaeb_auc['dy'] > 30) & (jaeb_auc['dy'] < 60) , 'time_bin'] = 'Week 6'
     jaeb_auc = jaeb_auc.drop_duplicates(['id', 'time_bin']).copy()
@@ -1288,7 +1291,7 @@ def testing_jaeb_final():
 
     ''' HbA1C (%)'''
     visits = ['Week 6', 'Month 3', 'Month 6', 'Month 9', 'Month 12']
-    jaeb_a1c = df_jaeb_t1d[['id', 'time_bin', 'dy', 'treatment_arm', 'hb_a1c']].compute()
+    jaeb_a1c = _to_pandas(df_jaeb_t1d[['id', 'time_bin', 'dy', 'treatment_arm', 'hb_a1c']])
     jaeb_a1c.loc[(jaeb_a1c['dy'] > 30) & (jaeb_auc['dy'] < 60) , 'time_bin'] = 'Week 6'
     jaeb_a1c = jaeb_a1c.drop_duplicates(['id', 'time_bin']).copy()
     jaeb_a1c = jaeb_a1c[jaeb_a1c['time_bin'].isin(visits)].copy()

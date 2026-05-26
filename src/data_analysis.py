@@ -2,7 +2,7 @@ import pandas as pd
 import dask.dataframe as dd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
-from scipy.stats import ttest_ind, ttest_rel, wilcoxon, mannwhitneyu, shapiro, kruskal, spearmanr, linregress, t, gmean, f_oneway, chi2, norm, rankdata
+from scipy.stats import ttest_ind, ttest_rel, wilcoxon, mannwhitneyu, shapiro, kruskal, spearmanr, linregress, t, gmean, f_oneway, chi2, norm, rankdata, fisher_exact
 from itertools import combinations
 import seaborn as sns
 import random
@@ -13,7 +13,7 @@ from matplotlib import colors as mcolors
 from matplotlib.ticker import MaxNLocator
 import importlib
 import math
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 from pathlib import Path
 import os
 import re
@@ -78,18 +78,15 @@ DATASET_CONFIG = {
     "jaeb_t1d": {"csv_folder": "./data/studies/jaeb_t1d", "preprocess": "preprocess_jaeb_t1d"}
 }
 
-# """ Workstream 1 """
-# POSITIVE_STUDIES = ['clvr']
-# NEGATIVE_STUDIES = ['bandit', 'cloud', 'defend', 'diagnode', 'gskalb', 'jaeb_t1d']
-# ALL_STUDIES = POSITIVE_STUDIES + NEGATIVE_STUDIES
+WORKSTREAM_1_STUDIES = ['bandit', 'cloud', 'clvr', 'defend', 'diagnode', 'gskalb', 'jaeb_t1d']
+WORKSTREAM_2_STUDIES = ['cloud', 'clvr']
 
-""" Workstream 2 """
 POSITIVE_STUDIES = ['clvr']
-NEGATIVE_STUDIES = ['cloud']
-ALL_STUDIES = POSITIVE_STUDIES + NEGATIVE_STUDIES
+NEGATIVE_STUDIES = [study for study in WORKSTREAM_1_STUDIES if study not in POSITIVE_STUDIES]
+ALL_STUDIES = WORKSTREAM_1_STUDIES
 
 TREATMENT_GROUP_1 = ['mdi', 'placebo', 'control', 'non-hcl']
-TREATMENT_GROUP_2 = ['cl', 'hcl', 'verapamil', 'diamyd', 'active', 'csii']
+TREATMENT_GROUP_2 = ['cl', 'hcl', 'verapamil', 'diamyd', 'active', 'csii', 'ip']
 
 FEATURE_LABELS_WITH_UNITS = {
     'total_ins_dose': 'Total Insulin Dose (Units/KG per day)',
@@ -98,6 +95,7 @@ FEATURE_LABELS_WITH_UNITS = {
     'gmi': 'GMI (%)',
     'TIR': 'Time In Range (% 3.9–10 mmol/L)',
     'TITR': 'Time In Tight Range (% 3.9–7.8 mmol/l)',
+    'TBR': 'Time Below Range (% <3.9 mmol/l)',
     'TBR_Lvl_1': 'Time Below Range Lvl 1 (% 3.0–3.9 mmol/l)',
     'TBR_Lvl_2': 'Time Below Range Lvl 2 (% <3.0 mmol/l)',
     'TAR_Lvl_1': 'Time Above Range Lvl 1 (% 10.0–13.9 mmol/l)',
@@ -107,7 +105,7 @@ FEATURE_LABELS_WITH_UNITS = {
     'cpep_auc_preservation': 'C-peptide AUC Preservation (%)',
     'cpep_auc': 'C-peptide AUC (nmol/l)'
 }
-CGM_CORE_ENDPOINTS = {'percent_wear_time','TIR','TITR','TBR_Lvl_1','TBR_Lvl_2','TAR_Lvl_1',
+CGM_CORE_ENDPOINTS = {'percent_wear_time','TIR','TITR','TBR','TBR_Lvl_1','TBR_Lvl_2','TAR_Lvl_1',
                       'TAR_Lvl_2','mean_glucose','median_glucose', 'min_glucose','max_glucose',
                       'std_glucose','cv_percent','GVP'}
 CGM_ENDPOINTS = CGM_CORE_ENDPOINTS | {'hb_a1c', 'gmi', 'total_ins_dose'}
@@ -217,9 +215,19 @@ class DataAnalysis:
         """
         Merge the nearest right-side row within +/- TOLERANCE_DAYS by id and day,
         considering only rows that contain at least one non-empty feature value.
+
+        Each right-side source row is assigned to only its closest left-side CGM
+        window. This prevents one clinical row from filling multiple adjacent
+        time bins. Distance ties prefer matching source/CGM time bins, then the
+        earlier CGM window. Source-row ties for the same CGM window prefer the
+        more complete source row, then the later source day.
         """
-        right_merge = right.drop(columns=['time_bin'], errors='ignore').copy()
-        value_columns = [col for col in right_merge.columns if col not in {'id', 'dy'}]
+        right_merge = right.copy()
+        if 'time_bin' in right_merge.columns:
+            right_merge['_source_time_bin'] = right_merge['time_bin']
+            right_merge.drop(columns=['time_bin'], inplace=True)
+
+        value_columns = [col for col in right_merge.columns if col not in {'id', 'dy', '_source_time_bin'}]
         if not value_columns:
             return left
 
@@ -230,23 +238,401 @@ class DataAnalysis:
 
         right_merge = (
             right_merge
-            .sort_values(by=['dy', 'id'])
+            .sort_values(by=['id', 'dy'])
             .reset_index(drop=True)
             .rename(columns={'dy': 'match_dy'})
         )
 
-        merged = pd.merge_asof(
-            left,
-            right_merge,
-            by='id',
-            left_on='cgm_window_dy',
-            right_on='match_dy',
-            direction='nearest',
-            tolerance=TOLERANCE_DAYS
+        left_keyed = left.copy().reset_index(drop=False).rename(columns={'index': '_left_row_id'})
+        assigned_rows = []
+        for subject_id, subject_right in right_merge.groupby('id', dropna=False):
+            subject_left = left_keyed[left_keyed['id'] == subject_id]
+            if subject_left.empty:
+                continue
+
+            for _, source_row in subject_right.iterrows():
+                distances = (subject_left['cgm_window_dy'] - source_row['match_dy']).abs()
+                min_distance = distances.min()
+                if pd.isna(min_distance) or min_distance > TOLERANCE_DAYS:
+                    continue
+
+                closest_left = subject_left.loc[distances == min_distance]
+                if len(closest_left) > 1:
+                    if '_source_time_bin' in source_row.index and 'time_bin' in closest_left.columns:
+                        same_time_bin = closest_left[closest_left['time_bin'] == source_row['_source_time_bin']]
+                        if len(same_time_bin) == 1:
+                            closest_left = same_time_bin
+                        elif len(same_time_bin) > 1:
+                            closest_left = same_time_bin.sort_values('cgm_window_dy').head(1)
+                        else:
+                            closest_left = closest_left.sort_values('cgm_window_dy').head(1)
+                    else:
+                        closest_left = closest_left.sort_values('cgm_window_dy').head(1)
+
+                if len(closest_left) != 1:
+                    raise ValueError(
+                        "Right-side clinical row tie could not be resolved for "
+                        f"id={subject_id}, source dy={source_row['match_dy']}."
+                    )
+
+                assigned_row = source_row.to_dict()
+                assigned_row['_left_row_id'] = closest_left['_left_row_id'].iloc[0]
+                assigned_row['_distance_days'] = min_distance
+                assigned_row['_n_values'] = source_row[value_columns].notna().sum()
+                assigned_rows.append(assigned_row)
+
+        if not assigned_rows:
+            return left
+
+        assigned = pd.DataFrame(assigned_rows)
+        assigned = assigned.sort_values(['_left_row_id', '_distance_days', 'match_dy'])
+        duplicate_left = assigned[assigned.duplicated('_left_row_id', keep=False)]
+        if not duplicate_left.empty:
+            for left_row_id, duplicates in duplicate_left.groupby('_left_row_id'):
+                min_distance = duplicates['_distance_days'].min()
+                tied = duplicates[duplicates['_distance_days'] == min_distance]
+                if len(tied) > 1:
+                    max_n_values = tied['_n_values'].max()
+                    completeness_tied = tied[tied['_n_values'] == max_n_values]
+                    if len(completeness_tied) > 1 and completeness_tied['match_dy'].nunique() < len(completeness_tied):
+                        raise ValueError(
+                            "Multiple right-side clinical rows tie for the same CGM window after completeness "
+                            "and source-day tie-breakers:\n"
+                            f"{completeness_tied[['id', 'match_dy', '_distance_days', '_n_values'] + value_columns].to_string(index=False)}"
+                        )
+
+            assigned = assigned.sort_values(
+                ['_left_row_id', '_distance_days', '_n_values', 'match_dy'],
+                ascending=[True, True, False, False]
+            ).drop_duplicates(
+                subset=['_left_row_id'],
+                keep='first'
+            )
+
+        merged = left_keyed.merge(
+            assigned[['_left_row_id', 'match_dy'] + value_columns],
+            on='_left_row_id',
+            how='left'
         )
-        return merged.drop(columns=['match_dy'], errors='ignore')
+        return merged.drop(columns=['_left_row_id', 'match_dy'], errors='ignore')
+
+    def convert_insulin_doses_to_units_per_kg(
+        self,
+        df_insulin: pd.DataFrame,
+        df_weight: pd.DataFrame,
+        dose_columns: list[str],
+        study_label: str
+    ) -> pd.DataFrame:
+        """
+        Convert visit-level insulin doses from units/day to U/kg/day.
+
+        Args:
+            df_insulin: Insulin table with `id`, `visit`, and dose columns.
+            df_weight: Weight table with `id`, `visit`, and `weight`.
+            dose_columns: Insulin dose columns to divide by same-visit weight.
+            study_label: Dataset label used in error messages.
+
+        Returns:
+            A copy of `df_insulin` with dose columns converted to U/kg/day when
+            same-visit weight is available; dose columns are set missing otherwise.
+
+        Raises:
+            ValueError: If required columns are missing or duplicate weights conflict.
+        """
+        required_insulin_cols = {'id', 'visit'} | set(dose_columns)
+        missing_insulin_cols = sorted(required_insulin_cols - set(df_insulin.columns))
+        if missing_insulin_cols:
+            raise ValueError(
+                f"Cannot weight-adjust {study_label} insulin doses because df_insulin is missing columns: "
+                f"{missing_insulin_cols}"
+            )
+
+        required_weight_cols = {'id', 'visit', 'weight'}
+        missing_weight_cols = sorted(required_weight_cols - set(df_weight.columns))
+        if missing_weight_cols:
+            raise ValueError(
+                f"Cannot weight-adjust {study_label} insulin doses because df_weight is missing columns: "
+                f"{missing_weight_cols}"
+            )
+
+        insulin = df_insulin.copy()
+        for col in dose_columns:
+            insulin[col] = pd.to_numeric(insulin[col], errors='coerce')
+
+        weights = df_weight[['id', 'visit', 'weight']].copy()
+        weights['weight'] = pd.to_numeric(weights['weight'], errors='coerce')
+        weights = weights.dropna(subset=['id', 'visit'])
+
+        nonmissing_weights = weights.dropna(subset=['weight'])
+        weight_counts = nonmissing_weights.groupby(['id', 'visit'])['weight'].nunique()
+        conflicting_weights = weight_counts[weight_counts > 1]
+        if not conflicting_weights.empty:
+            raise ValueError(
+                f"Cannot weight-adjust {study_label} insulin doses because these id/visit pairs have "
+                f"conflicting weights: {list(conflicting_weights.index)}"
+            )
+
+        weights['_weight_missing'] = weights['weight'].isna()
+        weights = (
+            weights
+            .sort_values(by=['id', 'visit', '_weight_missing'])
+            .drop_duplicates(subset=['id', 'visit'], keep='first')
+            .drop(columns=['_weight_missing'])
+        )
+        insulin = insulin.merge(weights, on=['id', 'visit'], how='left')
+        has_dose = insulin[dose_columns].notna().any(axis=1)
+        invalid_weight = insulin['weight'].isna() | (insulin['weight'] <= 0)
+        insulin.loc[has_dose & invalid_weight, dose_columns] = np.nan
+
+        convertible = has_dose & ~invalid_weight
+        insulin.loc[convertible, dose_columns] = insulin.loc[convertible, dose_columns].div(
+            insulin.loc[convertible, 'weight'],
+            axis=0
+        )
+        return insulin.drop(columns=['weight'])
+
+    def fill_missing_visit_features_from_nearest_event_date(
+        self,
+        df: pd.DataFrame,
+        source_df: pd.DataFrame,
+        value_columns: list[str],
+        source_label: str,
+        tolerance_days: int = 30
+    ) -> pd.DataFrame:
+        """
+        Fill missing visit-level features from the nearest same-subject source visit.
+
+        Args:
+            df: CGM-anchored table with `id`, `visit`, `timestamp`, and target columns.
+            source_df: Visit-level source table with `id`, `visit`, `event_date`, and target columns.
+            value_columns: Columns to fill only when missing.
+            source_label: Prefix for temporary audit columns.
+            tolerance_days: Maximum allowed date distance.
+
+        Returns:
+            A copy of `df` with missing target values filled.
+
+        Raises:
+            ValueError: If required columns are missing or source dates cannot be parsed.
+        """
+        required_df_cols = {'id', 'visit', 'timestamp'} | set(value_columns)
+        missing_df_cols = sorted(required_df_cols - set(df.columns))
+        if missing_df_cols:
+            raise ValueError(
+                f"Cannot fill {source_label} features because df is missing columns: {missing_df_cols}"
+            )
+
+        required_source_cols = {'id', 'visit', 'event_date'} | set(value_columns)
+        missing_source_cols = sorted(required_source_cols - set(source_df.columns))
+        if missing_source_cols:
+            raise ValueError(
+                f"Cannot fill {source_label} features because source_df is missing columns: {missing_source_cols}"
+            )
+
+        filled = df.copy()
+        source = source_df[['id', 'visit', 'event_date'] + value_columns].copy()
+        source_has_values = source[value_columns].notna().any(axis=1).any()
+        source['event_date'] = pd.to_datetime(source['event_date'], errors='coerce')
+        source = source.dropna(subset=['id', 'visit', 'event_date'])
+        if source.empty:
+            if source_has_values:
+                raise ValueError(
+                    f"Cannot fill {source_label} features because source values exist but no valid event dates were found."
+                )
+            return filled
+
+        target_visits = (
+            filled.dropna(subset=['id', 'visit', 'timestamp'])
+            .groupby(['id', 'visit'], as_index=False)
+            .agg(
+                cgm_visit_anchor_date=('timestamp', 'median'),
+                **{col: (col, 'first') for col in value_columns}
+            )
+        )
+
+        fill_records = []
+        for _, target_row in target_visits.iterrows():
+            record = {'id': target_row['id'], 'visit': target_row['visit']}
+            source_for_id = source[source['id'] == target_row['id']]
+            if source_for_id.empty:
+                fill_records.append(record)
+                continue
+
+            for col in value_columns:
+                value_col = f'_{source_label}_{col}_fill_value'
+                source_visit_col = f'{source_label}_{col}_source_visit'
+                source_date_col = f'{source_label}_{col}_source_event_date'
+                days_col = f'{source_label}_{col}_days_from_cgm_visit'
+                record[value_col] = np.nan
+                record[source_visit_col] = pd.NA
+                record[source_date_col] = pd.NaT
+                record[days_col] = np.nan
+
+                if pd.notna(target_row[col]):
+                    continue
+
+                source_for_metric = source_for_id[source_for_id[col].notna()].copy()
+                if source_for_metric.empty or pd.isna(target_row['cgm_visit_anchor_date']):
+                    continue
+
+                source_for_metric['_distance_days'] = (
+                    source_for_metric['event_date'] - target_row['cgm_visit_anchor_date']
+                ).abs().dt.days
+                source_for_metric = source_for_metric[source_for_metric['_distance_days'] <= tolerance_days]
+                if source_for_metric.empty:
+                    continue
+
+                min_distance = source_for_metric['_distance_days'].min()
+                nearest = source_for_metric[source_for_metric['_distance_days'] == min_distance]
+                chosen = nearest.sort_values(by=['event_date', 'visit']).iloc[0]
+                record[value_col] = chosen[col]
+                record[source_visit_col] = chosen['visit']
+                record[source_date_col] = chosen['event_date']
+                record[days_col] = chosen['_distance_days']
+
+            fill_records.append(record)
+
+        fill_df = pd.DataFrame(fill_records)
+        if fill_df.empty:
+            return filled
+
+        filled = filled.merge(fill_df, on=['id', 'visit'], how='left')
+        for col in value_columns:
+            value_col = f'_{source_label}_{col}_fill_value'
+            if value_col in filled.columns:
+                filled[col] = filled[col].combine_first(filled[value_col])
+                filled.drop(columns=[value_col], inplace=True)
+
+        return filled
+
+    def fill_missing_visit_block_from_nearest_event_date(
+        self,
+        df: pd.DataFrame,
+        source_df: pd.DataFrame,
+        value_columns: list[str],
+        source_label: str,
+        tolerance_days: int = 30
+    ) -> pd.DataFrame:
+        """
+        Fill an incomplete visit-level block from one nearest complete source row.
+
+        Args:
+            df: CGM-anchored table with `id`, `visit`, `timestamp`, and block columns.
+            source_df: Visit-level source table with `id`, `visit`, `event_date`, and block columns.
+            value_columns: Block columns that must move together.
+            source_label: Prefix for temporary audit columns.
+            tolerance_days: Maximum allowed date distance.
+
+        Returns:
+            A copy of `df` with incomplete blocks replaced from one complete source row.
+
+        Raises:
+            ValueError: If required columns are missing or source dates cannot be parsed.
+        """
+        required_df_cols = {'id', 'visit', 'timestamp'} | set(value_columns)
+        missing_df_cols = sorted(required_df_cols - set(df.columns))
+        if missing_df_cols:
+            raise ValueError(
+                f"Cannot fill {source_label} block because df is missing columns: {missing_df_cols}"
+            )
+
+        required_source_cols = {'id', 'visit', 'event_date'} | set(value_columns)
+        missing_source_cols = sorted(required_source_cols - set(source_df.columns))
+        if missing_source_cols:
+            raise ValueError(
+                f"Cannot fill {source_label} block because source_df is missing columns: {missing_source_cols}"
+            )
+
+        filled = df.copy()
+        source = source_df[['id', 'visit', 'event_date'] + value_columns].copy()
+        source_has_values = source[value_columns].notna().any(axis=1).any()
+        source['event_date'] = pd.to_datetime(source['event_date'], errors='coerce')
+        source = source.dropna(subset=['id', 'visit', 'event_date'])
+        if source.empty:
+            if source_has_values:
+                raise ValueError(
+                    f"Cannot fill {source_label} block because source values exist but no valid event dates were found."
+                )
+            return filled
+
+        complete_source = source.dropna(subset=value_columns)
+        if complete_source.empty:
+            return filled
+
+        target_visits = (
+            filled.dropna(subset=['id', 'visit', 'timestamp'])
+            .groupby(['id', 'visit'], as_index=False)
+            .agg(
+                cgm_visit_anchor_date=('timestamp', 'median'),
+                **{col: (col, 'first') for col in value_columns}
+            )
+        )
+
+        fill_records = []
+        for _, target_row in target_visits.iterrows():
+            record = {'id': target_row['id'], 'visit': target_row['visit']}
+            for col in value_columns:
+                record[f'_{source_label}_{col}_fill_value'] = np.nan
+            record[f'{source_label}_source_visit'] = pd.NA
+            record[f'{source_label}_source_event_date'] = pd.NaT
+            record[f'{source_label}_days_from_cgm_visit'] = np.nan
+
+            if target_row[value_columns].notna().all():
+                fill_records.append(record)
+                continue
+
+            source_for_id = complete_source[complete_source['id'] == target_row['id']].copy()
+            if source_for_id.empty or pd.isna(target_row['cgm_visit_anchor_date']):
+                fill_records.append(record)
+                continue
+
+            source_for_id['_distance_days'] = (
+                source_for_id['event_date'] - target_row['cgm_visit_anchor_date']
+            ).abs().dt.days
+            source_for_id = source_for_id[source_for_id['_distance_days'] <= tolerance_days]
+            if source_for_id.empty:
+                fill_records.append(record)
+                continue
+
+            min_distance = source_for_id['_distance_days'].min()
+            nearest = source_for_id[source_for_id['_distance_days'] == min_distance]
+            chosen = nearest.sort_values(by=['event_date', 'visit']).iloc[0]
+            for col in value_columns:
+                record[f'_{source_label}_{col}_fill_value'] = chosen[col]
+            record[f'{source_label}_source_visit'] = chosen['visit']
+            record[f'{source_label}_source_event_date'] = chosen['event_date']
+            record[f'{source_label}_days_from_cgm_visit'] = chosen['_distance_days']
+            fill_records.append(record)
+
+        fill_df = pd.DataFrame(fill_records)
+        if fill_df.empty:
+            return filled
+
+        filled = filled.merge(fill_df, on=['id', 'visit'], how='left')
+        for col in value_columns:
+            value_col = f'_{source_label}_{col}_fill_value'
+            if value_col in filled.columns:
+                filled[col] = filled[value_col].combine_first(filled[col])
+                filled.drop(columns=[value_col], inplace=True)
+
+        return filled
 
     def preprocess_bandit(self, csv_folder: str, save_csv: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Preprocess BANDIT into a CGM-anchored longitudinal table and summary.
+        Insulin dose columns keep their names but are standardized to U/kg/day.
+
+        Args:
+            csv_folder: BANDIT dataset root containing `original/` source files.
+            save_csv: Whether to write cleaned intermediates and final CSV output.
+
+        Returns:
+            Final processed dataframe and one-row summary dataframe.
+
+        Raises:
+            ValueError: If visit-time-bin mapping is ambiguous, diagnosis timing is missing,
+                insulin rows lack same-visit weight, or nearest-fill source dates cannot be parsed.
+        """
         def normalize_merge_keys(df: pd.DataFrame) -> pd.DataFrame:
             if 'id' in df.columns:
                 df['id'] = df['id'].astype('string').str.strip()
@@ -261,6 +647,8 @@ class DataAnalysis:
             tolerance_days: int = 30
         ) -> pd.DataFrame:
             unscheduled_visits = {'Unscheduled On-Site Visit', 'Unscheduled Remote Visit'}
+            df_left = normalize_merge_keys(df_left.copy())
+            df_right = normalize_merge_keys(df_right.copy())
             if df_right.empty:
                 return df_left
 
@@ -309,6 +697,7 @@ class DataAnalysis:
         df_cgm = pd.read_csv(f'{csv_folder}/original/BANDIT_CGM_selfp.csv')
         df_cgm.rename(columns={'visit': 'visit', 'id': 'id'}, inplace=True)
         df_cgm = normalize_merge_keys(df_cgm)
+        df_cgm = df_cgm[df_cgm['id'] != 'RMH-004'].copy()
         df_cgm['timestamp'] = pd.to_datetime(df_cgm['timestamp'], errors='coerce')
         df_cgm['glucose mmol/l'] = pd.to_numeric(df_cgm['glucose mmol/l'], errors='coerce')
         df_cgm_clean = df_cgm.dropna(subset=['timestamp', 'glucose mmol/l']).copy()
@@ -381,6 +770,7 @@ class DataAnalysis:
         df_hba1c.rename(columns={'Subject unique ID': 'id', 'Event name': 'visit', 'Event date': 'event_date', 'HbA1c': 'hb_a1c'}, inplace=True)
         df_hba1c = normalize_merge_keys(df_hba1c)
         df_hba1c['event_date'] = pd.to_datetime(df_hba1c['event_date'], errors='coerce', dayfirst=True)
+        df_hba1c['hb_a1c'] = pd.to_numeric(df_hba1c['hb_a1c'], errors='coerce')
         df_hba1c_clean = df_hba1c.dropna(subset=['hb_a1c'])
 
         df_mmtt = pd.read_csv(f'{csv_folder}/original/BANDIT_MTT.csv')
@@ -409,6 +799,29 @@ class DataAnalysis:
                               'glucose_90_min', 'glucose_120_min']]
         df_glucose_clean = df_glucose.dropna(subset=['glucose_0_min', 'glucose_15_min', 'glucose_30_min', 'glucose_60_min',
                                                      'glucose_90_min', 'glucose_120_min'])
+        mmtt_block_cols = [
+            'cpep_pre10_min',
+            'cpep_0_min',
+            'cpep_15_min',
+            'cpep_30_min',
+            'cpep_60_min',
+            'cpep_90_min',
+            'cpep_120_min',
+            'cpep_auc',
+            'glucose_pre10_min',
+            'glucose_0_min',
+            'glucose_15_min',
+            'glucose_30_min',
+            'glucose_60_min',
+            'glucose_90_min',
+            'glucose_120_min'
+        ]
+        df_mmtt_block = df_cpep.merge(
+            df_glucose,
+            on=['id', 'visit', 'event_date'],
+            how='outer'
+        )
+        df_mmtt_block = df_mmtt_block[['id', 'visit', 'event_date'] + mmtt_block_cols]
         
         df_insulin = pd.read_csv(f'{csv_folder}/original/BANDIT_IU.csv')
         df_insulin = df_insulin[['Subject unique ID', 'Event name', 'Event date', 'Basal Insulin Average Dose', 'Bolus Insulin Average Dose']]
@@ -416,29 +829,74 @@ class DataAnalysis:
                                    'Bolus Insulin Average Dose': 'bolus_ins_dose'}, inplace=True)
         df_insulin = normalize_merge_keys(df_insulin)
         df_insulin['event_date'] = pd.to_datetime(df_insulin['event_date'], errors='coerce', dayfirst=True)
+        df_insulin['basal_ins_dose'] = pd.to_numeric(df_insulin['basal_ins_dose'], errors='coerce')
+        df_insulin['bolus_ins_dose'] = pd.to_numeric(df_insulin['bolus_ins_dose'], errors='coerce')
         df_insulin['total_ins_dose'] = df_insulin['basal_ins_dose'] + df_insulin['bolus_ins_dose']
-        df_insulin_clean = df_insulin.dropna(subset=['basal_ins_dose', 'bolus_ins_dose'])
 
         df_insulin_pump = pd.read_csv(f'{csv_folder}/original/BANDIT_CIP.csv')
-        df_insulin_pump = df_insulin_pump[['Subject unique ID', 'Event name', 'Use CSII Insulin Pump']]
-        df_insulin_pump.rename(columns={'Subject unique ID': 'id', 'Event name': 'visit', 'Use CSII Insulin Pump': 'insulin_delivery'}, inplace=True)
+        df_insulin_pump = df_insulin_pump[['Subject unique ID', 'Event name', 'Event date', 'Use CSII Insulin Pump']]
+        df_insulin_pump.rename(
+            columns={
+                'Subject unique ID': 'id',
+                'Event name': 'visit',
+                'Event date': 'event_date',
+                'Use CSII Insulin Pump': 'insulin_delivery'
+            },
+            inplace=True
+        )
         df_insulin_pump = normalize_merge_keys(df_insulin_pump)
+        df_insulin_pump['event_date'] = pd.to_datetime(df_insulin_pump['event_date'], errors='coerce', dayfirst=True)
         insulin_delivery_raw = df_insulin_pump['insulin_delivery'].astype(str).str.strip()
         df_insulin_pump.loc[insulin_delivery_raw == 'Yes', 'insulin_delivery'] = 'CSII'
         df_insulin_pump.loc[insulin_delivery_raw == 'No', 'insulin_delivery'] = 'Non-CSII'
+        df_insulin_pump_clean = df_insulin_pump.dropna(subset=['insulin_delivery'])
 
         df_extra = pd.read_csv(f'{csv_folder}/original/BANDIT participants_Dx to randomization and baseline characteristics.csv')
-        df_extra = df_extra[['Subject unique ID', 'Age Range', 'gender', 'race', 'Tx']]
-        df_extra.rename(columns={'Subject unique ID': 'id', 'Age Range': 'age', 'gender': 'sex',
-                                 'Tx': 'treatment_arm'}, inplace=True)
+        df_extra = df_extra[
+            [
+                'Subject unique ID',
+                'Age Range',
+                'gender',
+                'race',
+                'Tx',
+                'Visit 3 Randomization day-Visit Date ',
+                'Dx to randomization, days'
+            ]
+        ]
+        df_extra.rename(
+            columns={
+                'Subject unique ID': 'id',
+                'Age Range': 'age_range',
+                'gender': 'sex',
+                'Tx': 'treatment_arm',
+                'Visit 3 Randomization day-Visit Date ': 'randomization_date',
+                'Dx to randomization, days': 'dx_to_randomization_days'
+            },
+            inplace=True
+        )
         df_extra = normalize_merge_keys(df_extra)
+        age_bounds = df_extra['age_range'].astype(str).str.extract(r'(\d+)\s*-\s*(\d+)').astype(float)
+        df_extra['age'] = age_bounds.mean(axis=1)
+        df_extra['randomization_date'] = pd.to_datetime(df_extra['randomization_date'], errors='coerce')
+        df_extra['dx_to_randomization_days'] = pd.to_numeric(df_extra['dx_to_randomization_days'], errors='coerce')
+        df_extra['diagnose_date'] = (
+            df_extra['randomization_date'] -
+            pd.to_timedelta(df_extra['dx_to_randomization_days'], unit='D')
+        )
+        if df_extra['diagnose_date'].dropna().empty:
+            raise ValueError("Cannot infer BANDIT diagnosis dates from randomization date and Dx-to-randomization days.")
+        df_extra.drop(columns=['randomization_date', 'dx_to_randomization_days'], inplace=True)
         
         df_height_weight = pd.read_csv(f'{csv_folder}/original/BANDIT_weights and heights.csv')
         df_height_weight = df_height_weight.loc[
-            :, df_height_weight.columns.str.contains(r'Subject unique ID|Weight|Height', case=False, regex=True)
+            :, df_height_weight.columns.str.contains(r'Subject unique ID|Weight|Height|Date', case=False, regex=True)
         ]
+        assessed_cols = (
+            df_height_weight.columns.str.contains(r'Assessed', case=False, regex=True)
+            & ~df_height_weight.columns.str.contains(r'Assessment Date', case=False, regex=True)
+        )
         df_height_weight = df_height_weight.loc[
-            :, ~df_height_weight.columns.str.contains(r'Assessed', case=False, regex=True)
+            :, ~assessed_cols
         ]
         id_col = 'Subject unique ID'
         value_cols = [col for col in df_height_weight.columns if col != id_col]
@@ -456,27 +914,105 @@ class DataAnalysis:
         df_height_weight_long['visit'] = df_height_weight_long['visit'].str.strip()
         df_height_weight_long['metric'] = df_height_weight_long['metric'].str.lower()
 
+        df_height_weight_dates = df_height_weight.melt(
+            id_vars=[id_col],
+            value_vars=value_cols,
+            var_name='source_column',
+            value_name='event_date'
+        )
+        df_height_weight_dates['visit'] = df_height_weight_dates['source_column'].str.extract(
+            r'^(.*?)\(\d+\).*?(?:Vitals Assessment Date|Date)\s*$'
+        )
+        df_height_weight_dates = df_height_weight_dates.dropna(subset=['visit', 'event_date'])
+        df_height_weight_dates['visit'] = df_height_weight_dates['visit'].str.strip()
+        df_height_weight_dates['event_date'] = pd.to_datetime(df_height_weight_dates['event_date'], errors='coerce')
+        df_height_weight_dates['date_priority'] = np.where(
+            df_height_weight_dates['source_column'].str.contains(r'Vitals Assessment Date', case=False, regex=True),
+            0,
+            1
+        )
+        df_height_weight_dates = (
+            df_height_weight_dates
+            .dropna(subset=['event_date'])
+            .sort_values(by=[id_col, 'visit', 'date_priority'])
+            .drop_duplicates(subset=[id_col, 'visit'], keep='first')[[id_col, 'visit', 'event_date']]
+        )
+
         df_height_weight = df_height_weight_long.pivot_table(
             index=[id_col, 'visit'],
             columns='metric',
             values='value',
             aggfunc='first'
         ).reset_index()
+        df_height_weight = df_height_weight.merge(df_height_weight_dates, on=[id_col, 'visit'], how='left')
         df_height_weight.rename(columns={id_col: 'id'}, inplace=True)
         df_height_weight.rename_axis(None, axis=1, inplace=True)
-        df_height_weight = df_height_weight.reindex(columns=['id', 'visit', 'weight', 'height'])
+        df_height_weight = df_height_weight.reindex(columns=['id', 'visit', 'event_date', 'weight', 'height'])
         df_height_weight = normalize_merge_keys(df_height_weight)
         df_height_weight['weight'] = pd.to_numeric(df_height_weight['weight'], errors='coerce')
         df_height_weight['height'] = pd.to_numeric(df_height_weight['height'], errors='coerce')
         df_height_weight_clean = df_height_weight.dropna(subset=['weight'])
+        df_insulin = self.convert_insulin_doses_to_units_per_kg(
+            df_insulin=df_insulin,
+            df_weight=df_height_weight,
+            dose_columns=['basal_ins_dose', 'bolus_ins_dose', 'total_ins_dose'],
+            study_label='BANDIT'
+        )
+        df_insulin_clean = df_insulin.dropna(subset=['basal_ins_dose', 'bolus_ins_dose'])
 
         df_final = df_cgm_clean.copy()
         print(df_final.shape)
         df_final = df_final.merge(df_extra, on=['id'], how='left')
+        missing_diagnosis_ids = sorted(df_final.loc[df_final['diagnose_date'].isna(), 'id'].dropna().unique())
+        if missing_diagnosis_ids:
+            raise ValueError(
+                "Cannot compute BANDIT days_from_diagnosis because diagnosis date is missing for ids: "
+                f"{missing_diagnosis_ids}"
+            )
+        df_final['days_from_diagnosis'] = (
+            df_final['timestamp'].dt.normalize() -
+            df_final['diagnose_date'].dt.normalize()
+        ).dt.days
+        df_final['diagnose_date'] = df_final['diagnose_date'].dt.date
         print(df_final.shape)
-        df_final = df_final.merge(df_height_weight, on=['id','visit'], how='left')
+        df_final = df_final.merge(df_height_weight[['id', 'visit', 'weight', 'height']], on=['id','visit'], how='left')
+        df_final = self.fill_missing_visit_features_from_nearest_event_date(
+            df_final,
+            df_height_weight,
+            value_columns=['weight', 'height'],
+            source_label='height_weight',
+            tolerance_days=30
+        )
+        df_final.drop(
+            columns=[
+                'height_weight_weight_source_visit',
+                'height_weight_weight_source_event_date',
+                'height_weight_weight_days_from_cgm_visit',
+                'height_weight_height_source_visit',
+                'height_weight_height_source_event_date',
+                'height_weight_height_days_from_cgm_visit'
+            ],
+            errors='ignore',
+            inplace=True
+        )
         print(df_final.shape)
         df_final = df_final.merge(df_hba1c_clean[['id', 'visit', 'hb_a1c']], on=['id','visit'], how='left')
+        df_final = self.fill_missing_visit_features_from_nearest_event_date(
+            df_final,
+            df_hba1c_clean,
+            value_columns=['hb_a1c'],
+            source_label='hba1c',
+            tolerance_days=30
+        )
+        df_final.drop(
+            columns=[
+                'hba1c_hb_a1c_source_visit',
+                'hba1c_hb_a1c_source_event_date',
+                'hba1c_hb_a1c_days_from_cgm_visit'
+            ],
+            errors='ignore',
+            inplace=True
+        )
         print(df_final.shape)
         df_final = df_final.merge(
             df_cpep[['id', 'visit', 'cpep_pre10_min', 'cpep_0_min', 'cpep_15_min', 'cpep_30_min', 'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'cpep_auc']],
@@ -489,16 +1025,81 @@ class DataAnalysis:
             on=['id','visit'],
             how='left'
         ) # Bucket 2
+        df_final = self.fill_missing_visit_block_from_nearest_event_date(
+            df_final,
+            df_mmtt_block,
+            value_columns=mmtt_block_cols,
+            source_label='mmtt',
+            tolerance_days=30
+        )
+        df_final.drop(
+            columns=[
+                'mmtt_source_visit',
+                'mmtt_source_event_date',
+                'mmtt_days_from_cgm_visit'
+            ],
+            errors='ignore',
+            inplace=True
+        )
         print(df_final.shape)
-        df_final = df_final.merge(df_insulin_pump, on=['id','visit'], how='left')
+        df_final = df_final.merge(df_insulin_pump_clean[['id', 'visit', 'insulin_delivery']], on=['id','visit'], how='left')
+        df_final = self.fill_missing_visit_features_from_nearest_event_date(
+            df_final,
+            df_insulin_pump_clean,
+            value_columns=['insulin_delivery'],
+            source_label='insulin_delivery',
+            tolerance_days=30
+        )
+        df_final.drop(
+            columns=[
+                'insulin_delivery_insulin_delivery_source_visit',
+                'insulin_delivery_insulin_delivery_source_event_date',
+                'insulin_delivery_insulin_delivery_days_from_cgm_visit'
+            ],
+            errors='ignore',
+            inplace=True
+        )
         print(df_final.shape)
         df_final = df_final.merge(df_insulin[['id', 'visit', 'basal_ins_dose', 'bolus_ins_dose', 'total_ins_dose']], on=['id','visit'], how='left') # Bucket 2
+        df_final = self.fill_missing_visit_features_from_nearest_event_date(
+            df_final,
+            df_insulin_clean,
+            value_columns=['basal_ins_dose', 'bolus_ins_dose', 'total_ins_dose'],
+            source_label='insulin',
+            tolerance_days=30
+        )
+        df_final.drop(
+            columns=[
+                'insulin_basal_ins_dose_source_visit',
+                'insulin_basal_ins_dose_source_event_date',
+                'insulin_basal_ins_dose_days_from_cgm_visit',
+                'insulin_bolus_ins_dose_source_visit',
+                'insulin_bolus_ins_dose_source_event_date',
+                'insulin_bolus_ins_dose_days_from_cgm_visit',
+                'insulin_total_ins_dose_source_visit',
+                'insulin_total_ins_dose_source_event_date',
+                'insulin_total_ins_dose_days_from_cgm_visit'
+            ],
+            errors='ignore',
+            inplace=True
+        )
         print(df_final.shape)
         df_final = merge_unscheduled_by_event_date(df_final, df_hba1c_clean, ['hb_a1c'])
-        df_final = merge_unscheduled_by_event_date(df_final, df_cpep, ['cpep_pre10_min', 'cpep_0_min', 'cpep_15_min', 'cpep_30_min', 'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'cpep_auc'])
-        df_final = merge_unscheduled_by_event_date(df_final, df_glucose, ['glucose_pre10_min', 'glucose_0_min', 'glucose_15_min', 'glucose_30_min', 'glucose_60_min', 'glucose_90_min', 'glucose_120_min'])
         df_final = merge_unscheduled_by_event_date(df_final, df_insulin, ['basal_ins_dose', 'bolus_ins_dose', 'total_ins_dose'])
-        df_final = self.fill_static_within_time_bin(df_final)
+        df_final = self.fill_static_within_time_bin(
+            df_final,
+            extra_exclude={
+                'weight',
+                'height',
+                'diagnose_date',
+                'days_from_diagnosis',
+                'hb_a1c',
+                'insulin_delivery',
+                'basal_ins_dose',
+                'bolus_ins_dose',
+                'total_ins_dose'
+            } | set(mmtt_block_cols)
+        )
         self.get_gmi(df_final)
         self.get_beta_2_scores(df_final)
         self.get_beta_3_score(df_final)
@@ -553,6 +1154,9 @@ class DataAnalysis:
         """
         Preprocesses the CLOUD dataset by cleaning, aligning visits, merging clinical/lab data,
         computing C‑peptide AUC and BETA2, and producing a final longitudinal table plus a summary.
+        Insulin dose columns keep their names but are standardized to U/kg/day.
+        Baseline height is filled from `CloudRecruitment.txt` when the baseline
+        MMTT procedure row has weight but no height.
 
         Args:
             csv_folder: Path to the dataset root containing the `original/` source files.
@@ -561,6 +1165,10 @@ class DataAnalysis:
             A tuple of:
                 - pd.DataFrame: Final processed dataset (`df_final`) with merged features.
                 - pd.DataFrame: One-row summary statistics table.
+
+        Raises:
+            ValueError: If insulin rows with dose values lack a positive same-visit weight,
+                or if recruitment contains conflicting baseline heights for a participant.
         """
         #Visit Info 
         df_visit_info = pd.read_csv(f'{csv_folder}/original/CloudVisitInfo.txt', sep="|")
@@ -579,7 +1187,6 @@ class DataAnalysis:
         df_insulin = df_insulin[['id', 'visit', 'total_ins_dose', 'basal_ins_dose', 'bolus_ins_dose']]
         insulin_visits = df_insulin['visit'].dropna().unique()
         df_visit_info = df_visit_info[df_visit_info['visit'].isin(insulin_visits)].copy()
-        df_insulin_clean = df_insulin.dropna(subset=['total_ins_dose', 'basal_ins_dose'])
 
         #CGM Data
         df_cgm = pd.read_csv(f'{csv_folder}/original/CloudAbbottCGM.txt', sep="|")
@@ -737,13 +1344,47 @@ class DataAnalysis:
         df_extra = df_extra[['id', 'age', 'treatment_arm', 'insulin_delivery']]
         df_extra_clean = df_extra.dropna(subset=['age'])
 
-        #TODO: Use CloudRecruitment.txt for baseline height
         df_height_weight = pd.read_csv(f'{csv_folder}/original/CloudMMTTProced.txt', sep="|")
         df_height_weight['PtID'] = df_height_weight['PtID'].str.strip()
         df_height_weight.rename(columns={'PtID':'id', 'Visit':'visit', 'Height':'height', 'Weight':'weight'}, inplace=True)
         df_height_weight.drop_duplicates(subset=['RecID'], inplace=True)
         df_height_weight = df_height_weight[['id', 'visit', 'height','weight']]
+        df_recruitment_height = pd.read_csv(f'{csv_folder}/original/CloudRecruitment.txt', sep="|")
+        df_recruitment_height['PtID'] = df_recruitment_height['PtID'].str.strip()
+        df_recruitment_height.rename(columns={'PtID':'id', 'Height':'baseline_height'}, inplace=True)
+        df_recruitment_height.drop_duplicates(subset=['RecID'], inplace=True)
+        df_recruitment_height = df_recruitment_height[['id', 'baseline_height']]
+        df_recruitment_height['baseline_height'] = pd.to_numeric(
+            df_recruitment_height['baseline_height'],
+            errors='coerce'
+        )
+        recruitment_height_counts = (
+            df_recruitment_height
+            .dropna(subset=['baseline_height'])
+            .groupby('id')['baseline_height']
+            .nunique()
+        )
+        conflicting_recruitment_heights = recruitment_height_counts[recruitment_height_counts > 1]
+        if not conflicting_recruitment_heights.empty:
+            raise ValueError(
+                "CLOUD recruitment height has conflicting non-missing baseline heights for ids: "
+                f"{sorted(conflicting_recruitment_heights.index.tolist())}"
+            )
+        df_height_weight = df_height_weight.merge(df_recruitment_height, on='id', how='left')
+        baseline_visit_mask = df_height_weight['visit'].astype(str).str.strip().str.lower() == 'baseline visit'
+        missing_height_mask = pd.to_numeric(df_height_weight['height'], errors='coerce').isna()
+        df_height_weight.loc[baseline_visit_mask & missing_height_mask, 'height'] = (
+            df_height_weight.loc[baseline_visit_mask & missing_height_mask, 'baseline_height']
+        )
+        df_height_weight.drop(columns=['baseline_height'], inplace=True)
         df_height_weight_clean = df_height_weight.dropna(subset=['weight'])
+        df_insulin = self.convert_insulin_doses_to_units_per_kg(
+            df_insulin=df_insulin,
+            df_weight=df_height_weight,
+            dose_columns=['total_ins_dose', 'basal_ins_dose', 'bolus_ins_dose'],
+            study_label='CLOUD'
+        )
+        df_insulin_clean = df_insulin.dropna(subset=['total_ins_dose', 'basal_ins_dose'])
         
         df_demographic = pd.read_csv(f'{csv_folder}/original/CloudRecruitment.txt', sep="|")
         df_demographic['PtID'] = df_demographic['PtID'].str.strip()
@@ -757,6 +1398,9 @@ class DataAnalysis:
         df_final = df_final.merge(df_extra, on='id', how='left')
         print(df_final.shape)
         df_final = df_final.merge(df_demographic, on='id', how='left')
+        df_final = df_final.dropna(subset=['treatment_arm'])
+        if df_final.empty:
+            raise ValueError("CLOUD preprocessing has no CGM rows after dropping participants without treatment_arm.")
         print(df_final.shape)
         df_final = df_final.merge(df_height_weight, on=['id','visit'], how='left')
         print(df_final.shape)
@@ -844,7 +1488,9 @@ class DataAnalysis:
     def preprocess_clvr(self, csv_folder: str, save_csv: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Preprocesses the CLVR dataset: cleans CGM, aligns visits, merges demographics/labs/MMTT,
-        computes C‑peptide AUC and BETA2, normalizes units, and outputs a final table plus summary.
+        keeps diagnosis dates, computes C-peptide AUC and BETA2, normalizes units including
+        insulin doses to U/kg/day, keeps rows even when drug treatment arm is missing,
+        and outputs a final table plus summary.
 
         Args:
             csv_folder: Path to the dataset root containing the `original/` source files.
@@ -853,6 +1499,10 @@ class DataAnalysis:
             A tuple of:
                 - pd.DataFrame: Final processed dataset (`df_final`) with merged features.
                 - pd.DataFrame: One‑row summary statistics table.
+
+        Raises:
+            ValueError: If diagnosis dates cannot be parsed, if final rows lack diagnosis dates,
+                or if insulin rows lack same-visit weight.
         """  
         #CGM data
         df_cgm = pd.read_csv(f'{csv_folder}/original/cgmAnalysis.txt', sep="|")
@@ -925,13 +1575,19 @@ class DataAnalysis:
 
         #Extra features
         df_demographic = pd.read_csv(f'{csv_folder}/original/subjectsEnroll.txt', sep="|")
-        df_demographic.rename(columns={'PtID':'id', 'Gender':'sex', 'Ethnicity':'ethnicity', 'Race':'race'}, inplace=True)
+        df_demographic.rename(
+            columns={'PtID':'id', 'Gender':'sex', 'Ethnicity':'ethnicity', 'Race':'race', 'DiagDt': 'diagnose_date'},
+            inplace=True
+        )
         df_demographic.drop_duplicates(subset=['id'], inplace=True)
         df_demographic.sort_values(by=['id'], ascending=True, inplace=True)
+        df_demographic['diagnose_date'] = pd.to_datetime(df_demographic['diagnose_date'], format='%d%b%Y', errors='coerce')
+        if df_demographic['diagnose_date'].dropna().empty:
+            raise ValueError("CLVR preprocessing could not parse any diagnosis dates from subjectsEnroll.txt DiagDt.")
         df_demographic['insulin_delivery'] = df_demographic['hclGrp'].str.replace(r'^\d+\.', '', regex=True).str.strip()
         df_demographic['treatment_arm'] = df_demographic['drugGrp'].str.replace(r'^\d+\.', '', regex=True).str.strip()
-        # df_demographic = df_demographic[df_demographic['treatment_arm'].notna() & (df_demographic['treatment_arm'].str.strip() != '')]
-        df_demographic = df_demographic[['id', 'sex', 'ethnicity', 'race', 'treatment_arm', 'insulin_delivery']]
+        df_demographic['treatment_arm'] = df_demographic['treatment_arm'].replace('', np.nan)
+        df_demographic = df_demographic[['id', 'sex', 'ethnicity', 'race', 'treatment_arm', 'insulin_delivery', 'diagnose_date']]
         df_demographic['sex'] = df_demographic['sex'].map({'M': 0, 'F': 1})
 
         df_height_weight = pd.read_csv(f'{csv_folder}/original/visits.txt', sep="|")
@@ -970,8 +1626,14 @@ class DataAnalysis:
         df_hba1c = df_height_weight[['id', 'visit', 'hb_a1c']]
         df_hba1c_clean = df_hba1c.dropna(subset=['hb_a1c'])
 
-        df_insulin = df_height_weight[['id', 'visit', 'total_ins_dose', 'basal_ins_dose']]
+        df_insulin = df_height_weight[['id', 'visit', 'total_ins_dose', 'basal_ins_dose']].copy()
         df_insulin['bolus_ins_dose'] = df_insulin['total_ins_dose'] - df_insulin['basal_ins_dose']
+        df_insulin = self.convert_insulin_doses_to_units_per_kg(
+            df_insulin=df_insulin,
+            df_weight=df_height_weight,
+            dose_columns=['total_ins_dose', 'basal_ins_dose', 'bolus_ins_dose'],
+            study_label='CLVR'
+        )
         df_insulin_clean = df_insulin.dropna(subset=['total_ins_dose', 'basal_ins_dose'])
 
         df_height_weight = df_height_weight[['id', 'visit','height', 'weight', 'age']]
@@ -996,6 +1658,13 @@ class DataAnalysis:
         self.get_beta_2_scores(df_final)
         self.get_gmi(df_final)
         self.get_beta_3_score(df_final)
+        missing_diagnosis_ids = sorted(df_final.loc[df_final['diagnose_date'].isna(), 'id'].dropna().unique())
+        if missing_diagnosis_ids:
+            raise ValueError(
+                "CLVR preprocessing has final rows without diagnosis dates for ids: "
+                f"{missing_diagnosis_ids}"
+            )
+        df_final['diagnose_date'] = df_final['diagnose_date'].dt.date
 
         df_final['id'] = 'CLVR_' + df_final['id'].astype('str')
         
@@ -1178,7 +1847,6 @@ class DataAnalysis:
         df_final['diagnose_date'] = (df_final.groupby('id', group_keys=False)['diagnose_date'].transform(lambda s: s.dropna().min())).dt.date
         df_final.drop(columns=['diag_dy'], inplace=True)
         df_final['cpep_pre10_min'] = df_final['cpep_pre10_min'].fillna(df_final['cpep_0_min'])
-        df_final['total_ins_dose'] = df_final['total_ins_dose'] * df_final['weight']
         self.get_beta_2_scores(df_final)
         self.get_gmi(df_final)
         self.get_beta_3_score(df_final)
@@ -1298,6 +1966,7 @@ class DataAnalysis:
         df_insulin.rename(columns={'insulin_dose_upkgpday': 'total_ins_dose', 'insulin_pump': 'insulin_delivery'}, inplace=True)
         df_insulin.sort_values(by=['id', 'visit'], inplace=True)
         df_insulin['insulin_delivery'] = df_insulin['insulin_delivery'].map({'No': 'No insulin pump', 'Yes': 'Insulin pump'})
+        df_insulin.loc[df_insulin['visit'] == 'Visit 2', 'insulin_delivery'] = 'No insulin pump' 
         df_insulin_clean = df_insulin.dropna(subset=['total_ins_dose'])
 
         df_hba1c = df_aljc[['id', 'visit', 'hba1c_per']]
@@ -1331,7 +2000,6 @@ class DataAnalysis:
                              'glucose_90_min', 'glucose_120_min', 'total_ins_dose']]
         df_final['sex'] = df_final['sex'].map({'Male': 0, 'Female': 1})
         df_final['weight'] = pd.to_numeric(df_final['weight'], errors='coerce')
-        df_final['total_ins_dose'] = df_final['total_ins_dose'] * df_final['weight']
         self.get_beta_2_scores(df_final)
         self.get_gmi(df_final)
         self.get_beta_3_score(df_final)
@@ -1517,7 +2185,6 @@ class DataAnalysis:
         df_final['diagnose_date'] = (df_final.groupby('id', group_keys=False)['diagnose_date'].transform(lambda s: s.dropna().min())).dt.date
         df_final.drop(columns=['diag_dy'], inplace=True)
         df_final['cpep_pre10_min'] = df_final['cpep_pre10_min'].fillna(df_final['cpep_0_min'])
-        df_final['total_ins_dose'] = df_final['total_ins_dose'] * df_final['weight']
         self.get_beta_2_scores(df_final)
         self.get_gmi(df_final)
         self.get_beta_3_score(df_final)
@@ -1908,7 +2575,6 @@ class DataAnalysis:
         df_final['diagnose_date'] = (df_final.groupby('id', group_keys=False)['diagnose_date'].transform(lambda s: s.dropna().min())).dt.date
         df_final.drop(columns=['diag_dy'], inplace=True)
         df_final['cpep_pre10_min'] = df_final['cpep_pre10_min'].fillna(df_final['cpep_0_min'])
-        df_final['total_ins_dose'] = df_final['total_ins_dose'] * df_final['weight']
         self.get_beta_2_scores(df_final)
         self.get_gmi(df_final)
         self.get_beta_3_score(df_final)
@@ -1968,11 +2634,11 @@ class DataAnalysis:
     def get_beta_2_scores(self, df: pd.DataFrame) -> None:
         """
         Computes BETA2 score for each record using fasting C-peptide, glucose,
-        insulin dose, body weight, and HbA1c. Adds a new column `beta2_score` in place.
+        insulin dose in U/kg/day, and HbA1c. Adds `beta2_score` in place.
 
         Args:
             df: Input dataframe containing required numeric and lab columns.
-                 (weight, height, C-peptide timepoints, insulin, glucose, HbA1c)
+                 (C-peptide timepoints, insulin in U/kg/day, glucose, HbA1c)
 
         Returns:
             None. Modifies the input dataframe in place by adding `beta2_score`.
@@ -1990,16 +2656,16 @@ class DataAnalysis:
 
         df['cpep_fast'] = df['cpep_0_min']
         df['glucose_fast'] = df['glucose_0_min']
-        df['beta2_score'] = (np.sqrt(df['cpep_fast']) * (1 - (df['total_ins_dose']/df['weight'])))/(df['glucose_fast'] * df['hb_a1c']) * 1000
+        df['beta2_score'] = (np.sqrt(df['cpep_fast']) * (1 - df['total_ins_dose']))/(df['glucose_fast'] * df['hb_a1c']) * 1000
 
     def get_beta_3_score(self, df: pd.DataFrame) -> None:
         """
         Computes BETA3 score for each record using fasting C-peptide, glucose,
-        insulin dose, body weight, and GMI. Adds a new column `beta3_score` in place.
+        insulin dose in U/kg/day, and GMI. Adds `beta3_score` in place.
 
         Args:
             df: Input dataframe containing required numeric and lab columns.
-                 (weight, height, C-peptide timepoints, insulin, glucose, GMI)
+                 (C-peptide timepoints, insulin in U/kg/day, glucose, GMI)
 
         Returns:
             None. Modifies the input dataframe in place by adding `beta3_score`.
@@ -2017,7 +2683,7 @@ class DataAnalysis:
 
         df['cpep_fast'] = df['cpep_0_min']
         df['glucose_fast'] = df['glucose_0_min']
-        df['beta3_score'] = (np.sqrt(df['cpep_fast']) * (1 - (df['total_ins_dose']/df['weight'])))/(df['glucose_fast'] * df['gmi']) * 1000
+        df['beta3_score'] = (np.sqrt(df['cpep_fast']) * (1 - df['total_ins_dose']))/(df['glucose_fast'] * df['gmi']) * 1000
 
     def get_cgm_core_endpoints_general(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         """
@@ -2065,6 +2731,7 @@ class DataAnalysis:
                 - percent_wear_time: Percentage of expected wear time covered by valid data.
                 - TIR: Time in range 3.9–10.0 mmol/L (% of total time).
                 - TITR: Time in tight range 3.9–7.8 mmol/L (% of total time).
+                - TBR: Time below range <3.9 mmol/L (% of total time).
                 - TBR_Lvl_1: Time below range <3.9 and ≥3.0 mmol/L (% of total time).
                 - TBR_Lvl_2: Time below range <3.0 mmol/L (% of total time).
                 - TAR_Lvl_1: Time above range >10.0 and ≤13.9 mmol/L (% of total time).
@@ -2114,6 +2781,7 @@ class DataAnalysis:
         titr = df_group.loc[in_tight_range, 'time_diff'].sum()
         tbr_1 = df_group.loc[below_3_9, 'time_diff'].sum()
         tbr_2 = df_group.loc[below_3_0, 'time_diff'].sum()
+        tbr = tbr_1 + tbr_2
         tar_1 = df_group.loc[above_10, 'time_diff'].sum()
         tar_2 = df_group.loc[above_13_9, 'time_diff'].sum()
 
@@ -2124,6 +2792,7 @@ class DataAnalysis:
             'percent_wear_time': wear_pct,
             'TIR': (tir / total_time) * 100,
             'TITR': (titr / total_time) * 100,
+            'TBR': (tbr / total_time) * 100,
             'TBR_Lvl_1': (tbr_1 / total_time) * 100,
             'TBR_Lvl_2': (tbr_2 / total_time) * 100,
             'TAR_Lvl_1': (tar_1 / total_time) * 100,
@@ -2460,6 +3129,105 @@ class DataAnalysis:
         canvas.save(out_path, format="PNG")
         return out_path
 
+    def combine_age_strata_pngs(
+        self,
+        graph_root: str | Path,
+        dataset_names: list[str],
+        filenames: list[str],
+        age_cutoff: int | float,
+        padding: int = 4,
+        bg: tuple[int, int, int] = (255, 255, 255)
+    ) -> None:
+        """
+        Combine total and age-stratified PNGs within each dataset folder.
+
+        The output is saved under `{dataset}/combined_age_strata/{filename}`.
+        Source images are trimmed before merging, and no age-stratum labels are
+        added because the source PNG titles already identify each stratum.
+        Adjusted-means and Model 1 table summaries use a two-row presentation
+        with total centered above the two age strata. Model 2 fixed-effects
+        tables use a three-row vertical presentation. Endpoint plots use a
+        three-column presentation.
+
+        Raises:
+            FileNotFoundError: If a required source image is missing.
+            ValueError: If no dataset names or filenames are supplied.
+        """
+        if not dataset_names:
+            raise ValueError("Age-strata PNG combining requires at least one dataset name.")
+        if not filenames:
+            raise ValueError("Age-strata PNG combining requires at least one filename.")
+
+        graph_root = Path(graph_root)
+        cutoff_label = int(age_cutoff) if float(age_cutoff).is_integer() else str(age_cutoff).replace('.', '_')
+        strata_dirs = [
+            ('total', 'Total'),
+            (f'less_than_{cutoff_label}', f'Age <{age_cutoff:g}'),
+            (f'{cutoff_label}_or_above', f'Age >={age_cutoff:g}')
+        ]
+        centered_total_layout = {
+            'model_adjusted_means.png',
+            'model_adjusted_means_table.png',
+            'model1_fixed_effects_table.png'
+        }
+        vertical_layout = {'model2_fixed_effects_table.png'}
+
+        for dataset_name in dataset_names:
+            combined_dir = graph_root / dataset_name / 'combined_age_strata'
+            combined_dir.mkdir(parents=True, exist_ok=True)
+            for filename in filenames:
+                source_paths = [
+                    graph_root / dataset_name / strata_dir / filename
+                    for strata_dir, _ in strata_dirs
+                ]
+                missing_paths = [path for path in source_paths if not path.exists()]
+                if missing_paths:
+                    raise FileNotFoundError(
+                        f"Cannot combine age-strata PNG '{filename}' for {dataset_name}; "
+                        f"missing source files: {missing_paths}"
+                    )
+
+                images = []
+                for path in source_paths:
+                    image = Image.open(path).convert("RGB")
+                    bg_image = Image.new("RGB", image.size, color=bg)
+                    bbox = ImageChops.difference(image, bg_image).getbbox()
+                    if bbox is None:
+                        raise ValueError(f"Cannot combine blank age-strata PNG: {path}")
+                    images.append(image.crop(bbox))
+                max_w = max(image.width for image in images)
+                max_h = max(image.height for image in images)
+                use_centered_total = filename in centered_total_layout
+                use_vertical = filename in vertical_layout
+                ncols = 2 if use_centered_total else 1 if use_vertical else len(images)
+                nrows = 2 if use_centered_total else len(images) if use_vertical else 1
+                canvas_w = ncols * max_w + (ncols + 1) * padding
+                canvas_h = nrows * max_h + (nrows + 1) * padding
+                canvas = Image.new("RGB", (canvas_w, canvas_h), color=bg)
+
+                positions = (
+                    [
+                        ((canvas_w - max_w) // 2, padding),
+                        (padding, padding * 2 + max_h),
+                        (padding * 2 + max_w, padding * 2 + max_h)
+                    ]
+                    if use_centered_total
+                    else [
+                        (padding, padding + idx * (max_h + padding))
+                        for idx in range(len(images))
+                    ]
+                    if use_vertical
+                    else [
+                        (padding + idx * (max_w + padding), padding)
+                        for idx in range(len(images))
+                    ]
+                )
+
+                for image, (x, y) in zip(images, positions):
+                    canvas.paste(image, (x + (max_w - image.width) // 2, y))
+
+                canvas.save(combined_dir / filename, format="PNG")
+
     def plot_AGP(
         self,
         df_group: pd.DataFrame,
@@ -2539,7 +3307,7 @@ class DataAnalysis:
         summary_sources = [
             ('Group overall', group_endpoints, '#f57c00', 'dashed'),
             ('Group control', control_endpoints, "#0019f5", 'dashed'),
-            ('Group active', active_endpoints, "#e5f500", 'dashed'),
+            ('Group active', active_endpoints, "#F58518", 'dashed'),
             ('Healthy overall', healthy_endpoints, '#00f514', 'dashdot'),
             ('Established overall', established_endpoints, '#f50000', (0, (3, 2)))
         ]
@@ -2640,7 +3408,7 @@ class DataAnalysis:
         ax_plot.plot(xh, ref_he['value'], label='Healthy Reference', color="#00f514")
         ax_plot.plot(xh, ref_e['value'], label='Established Reference', color="#f50000")
         ax_plot.plot(xh, ref_c['value'], label='Control Median', color="#0019f5")
-        ax_plot.plot(xh, ref_a['value'], label='Active Median', color="#e5f500")
+        ax_plot.plot(xh, ref_a['value'], label='Active Median', color="#F58518")
         ax_plot.fill_between(xh, group_agp['q1'], group_agp['q3'], color='#08306b', alpha=0.7, label='25-75th Centile')
         ax_plot.fill_between(xh, group_agp['10th Centile'], group_agp['90th Centile'], color='#6baed6', alpha=0.5, label='10-90th Centile')
         ax_plot.set_xlim(0, 24)
@@ -2831,7 +3599,7 @@ class DataAnalysis:
             summary_sources = [
                 ('Group overall', subset_endpoints, '#f57c00', 'dashed'),
                 ('Group control', subset_control_endpoints, "#0019f5", 'dashed'),
-                ('Group active', subset_active_endpoints, "#e5f500", 'dashed'),
+                ('Group active', subset_active_endpoints, "#F58518", 'dashed'),
                 ('Healthy overall', healthy_endpoints, '#00f514', 'dashdot'),
                 ('Established overall', established_endpoints, '#f50000', (0, (3, 2)))
             ]
@@ -2938,9 +3706,9 @@ class DataAnalysis:
             elif not ref_c.empty:
                 ax_plot.plot(xh, ref_c['value'], label='Control Median', color="#0019f5")
             if not subset_ref_a.empty:
-                ax_plot.plot(xh, subset_ref_a['value'], label='Active Median', color="#e5f500")
+                ax_plot.plot(xh, subset_ref_a['value'], label='Active Median', color="#F58518")
             elif not ref_a.empty:
-                ax_plot.plot(xh, ref_a['value'], label='Active Median', color="#e5f500")
+                ax_plot.plot(xh, ref_a['value'], label='Active Median', color="#F58518")
             ax_plot.fill_between(xh, group_agp['q1'], group_agp['q3'], color='#08306b', alpha=0.7, label='25-75th Centile')
             ax_plot.fill_between(xh, group_agp['10th Centile'], group_agp['90th Centile'], color='#6baed6', alpha=0.5, label='10-90th Centile')
             ax_plot.set_xlim(0, 24)
@@ -3064,7 +3832,7 @@ class DataAnalysis:
             'Healthy': "#00f514",
             'Established T1D': "#f50000",
             'Standard Care': "#0019f5",
-            'AID': "#e5f500"
+            'AID': "#F58518"
         }
 
         out_dir = Path(path)
@@ -3252,6 +4020,71 @@ class DataAnalysis:
         ax.grid(False)
         ax.set_facecolor('white')
         ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
+
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+        return None
+
+    def plot_AGP_reference_curve(
+        self,
+        df_reference: pd.DataFrame,
+        label: str,
+        color: str,
+        path: str | Path
+    ) -> None:
+        """
+        Plot a single reference cohort AGP median curve.
+
+        Args:
+            df_reference: Reference CGM data with id, timestamp, and glucose mmol/l.
+            label: Display label for the reference cohort.
+            color: Line color for the median curve.
+            path: Destination PNG path.
+
+        Raises:
+            ValueError: If required columns are missing or no valid CGM rows remain.
+        """
+        required_cols = {'id', 'timestamp', 'glucose mmol/l'}
+        missing_cols = required_cols - set(df_reference.columns)
+        if missing_cols:
+            raise ValueError(f"{label} reference AGP is missing required columns: {sorted(missing_cols)}")
+
+        df_reference = df_reference[list(required_cols)].copy()
+        df_reference['timestamp'] = pd.to_datetime(df_reference['timestamp'], errors='coerce')
+        df_reference['glucose mmol/l'] = pd.to_numeric(df_reference['glucose mmol/l'], errors='coerce')
+        df_reference = df_reference.dropna(subset=['id', 'timestamp', 'glucose mmol/l'])
+        if df_reference.empty:
+            raise ValueError(f"{label} reference AGP has no valid CGM rows.")
+
+        df_reference['tod'] = df_reference['timestamp'].dt.floor('15min').dt.time
+        patient_results = (
+            df_reference
+            .groupby(['id', 'tod'])['glucose mmol/l']
+            .median()
+            .reset_index()
+            .rename(columns={'glucose mmol/l': 'median'})
+        )
+        median_curve = patient_results.groupby('tod')['median'].median()
+        if median_curve.empty:
+            raise ValueError(f"{label} reference AGP produced an empty median curve.")
+
+        xh = np.array([t.hour + t.minute / 60 + t.second / 3600 for t in median_curve.index], dtype=float)
+        fig, ax = plt.subplots(figsize=(7.5, 5.0))
+        ax.plot(xh, median_curve.values, label=label, color=color, linewidth=2.2)
+        ax.set_xlim(0, 24)
+        ax.set_xticks(np.arange(0, 25, 4))
+        ax.set_xticklabels([f"{int(h):02d}:00" for h in np.arange(0, 25, 4)])
+        ax.set_ylim(4, 12)
+        ax.set_title(f"{label} AGP", fontsize=11, fontweight='bold')
+        ax.set_xlabel("Time of Day")
+        ax.set_ylabel("Glucose (mmol/L)")
+        ax.grid(False)
+        ax.set_facecolor('white')
+        ax.legend(loc='upper right', frameon=False)
 
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3474,15 +4307,18 @@ class DataAnalysis:
         self,
         df: pd.DataFrame,
         out_path: str,
+        title: str = 'Completeness Table',
     ) -> None:
         """
-        Create a PNG table showing Total, Missing, Present, %Missing, %Present
-        for each feature, given:
-        - n_missing: pandas Series (index = feature, value = missing-count)
-        - n_total:   total row count (same for all features)
-        - out_dir:   directory to write the PNG into (created if missing)
+        Create a PNG table showing feature availability counts.
 
-        Returns the path to the saved PNG.
+        Args:
+            df: Availability table to render.
+            out_path: Path where the PNG is saved.
+            title: Figure title.
+
+        Returns:
+            None: Saves the PNG to `out_path`.
         """
         fig, ax = plt.subplots(figsize=(len(df.columns)*0.8, len(df)*0.3 + 1))
         ax.axis('off')
@@ -3499,10 +4335,310 @@ class DataAnalysis:
         tbl.set_fontsize(8)
         tbl.scale(1.2, 1.2)
 
-        ax.set_title('Completeness Table', fontsize=12, pad=20)
+        ax.set_title(title, fontsize=12, pad=20)
 
         plt.savefig(out_path, dpi=200, bbox_inches='tight')
         plt.close(fig)
+
+    def plot_dataframe_table(
+        self,
+        df: pd.DataFrame,
+        out_path: str | Path,
+        title: str,
+        font_size: int = 8,
+        cell_colors: pd.DataFrame | None = None,
+    ) -> None:
+        fig_width = max(8, len(df.columns) * 2.2)
+        row_height = 0.46 if font_size <= 6 else 0.55
+        fig_height = max(2.5, (len(df) + 1) * row_height + 0.8)
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+        ax.axis('off')
+        ax.axis('tight')
+
+        table = ax.table(
+            cellText=df.astype(str).values,
+            colLabels=df.columns,
+            cellLoc='center',
+            loc='upper center'
+        )
+        if cell_colors is not None:
+            for row_idx in range(len(df)):
+                for col_idx in range(len(df.columns)):
+                    color = cell_colors.iloc[row_idx, col_idx]
+                    if pd.notna(color):
+                        table[(row_idx + 1, col_idx)].set_facecolor(color)
+        table.auto_set_font_size(False)
+        table.set_fontsize(font_size)
+        table.scale(1.0, 2.1)
+        ax.set_title(title, fontsize=12, pad=8)
+
+        fig.savefig(out_path, dpi=300, bbox_inches='tight', pad_inches=0.08)
+        plt.close(fig)
+
+    def plot_lmm_fixed_effects_table(
+        self,
+        fixed_effects_df: pd.DataFrame,
+        figure_endpoints: list[str],
+        term_labels: dict[str, str],
+        term_order: list[str],
+        reference_term_label: str,
+        out_path: str | Path,
+        title: str
+    ) -> None:
+        """
+        Plot a fixed-effects summary table from formatted LMM coefficient rows.
+
+        Args:
+            fixed_effects_df: Fixed-effects rows with endpoint, term, estimate,
+                ci_lower, ci_upper, and p_value columns.
+            figure_endpoints: Endpoints to keep and order in the plotted table.
+            term_labels: Mapping from model term names to display labels.
+            term_order: Ordered display labels to show as table columns.
+            reference_term_label: Display label for the intercept/reference term;
+                this column is not significance-highlighted.
+            out_path: Destination PNG path.
+            title: Plot title.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If the fixed-effects table has no rows to plot.
+        """
+        table_source = fixed_effects_df.copy()
+        table_source['estimate_ci'] = table_source.apply(
+            lambda row: (
+                f"{row['estimate']:.2f} ({row['ci_lower']:.2f}, {row['ci_upper']:.2f})"
+                if row['term'] == 'Intercept'
+                else (
+                    f"{row['estimate']:.2f} ({row['ci_lower']:.2f}, {row['ci_upper']:.2f})\n"
+                    f"p={row['p_value']}"
+                )
+            ),
+            axis=1
+        )
+        table_source['term_label'] = table_source['term'].map(term_labels).fillna(table_source['term'])
+        fixed_effects_table = (
+            table_source.pivot_table(
+                index='endpoint',
+                columns='term_label',
+                values='estimate_ci',
+                aggfunc='first',
+                observed=False
+            )
+            .reindex(index=[e for e in figure_endpoints if e in set(table_source['endpoint'])])
+            .reset_index()
+            .rename(columns={'endpoint': 'Endpoint/terms'})
+        )
+        fixed_effects_table = fixed_effects_table[
+            [col for col in term_order if col in fixed_effects_table.columns]
+        ]
+        if fixed_effects_table.empty:
+            raise ValueError(f"{title}: fixed-effects table is empty.")
+
+        color_source = table_source.copy()
+        color_source['p_numeric'] = pd.to_numeric(
+            color_source['p_value'].astype(str).str.replace('<', '', regex=False),
+            errors='coerce'
+        )
+        color_source['cell_color'] = np.where(
+            color_source['p_numeric'] < 0.05,
+            '#d9ead3',
+            '#ffffff'
+        )
+        color_table = (
+            color_source.pivot_table(
+                index='endpoint',
+                columns='term_label',
+                values='cell_color',
+                aggfunc='first',
+                observed=False
+            )
+            .reindex(index=[e for e in figure_endpoints if e in set(color_source['endpoint'])])
+            .reset_index()
+            .rename(columns={'endpoint': 'Endpoint/terms'})
+        )
+        color_table['Endpoint/terms'] = '#ffffff'
+        color_table = color_table.reindex(columns=fixed_effects_table.columns)
+        if reference_term_label in color_table.columns:
+            color_table[reference_term_label] = '#ffffff'
+
+        self.plot_dataframe_table(
+            fixed_effects_table,
+            out_path,
+            title,
+            font_size=6,
+            cell_colors=color_table
+        )
+
+    def plot_lmm_model1_fixed_effects_with_slopes_table(
+        self,
+        fixed_effects_df: pd.DataFrame,
+        simple_slopes_df: pd.DataFrame,
+        figure_endpoints: list[str],
+        term_labels: dict[str, str],
+        term_order: list[str],
+        out_path: str | Path,
+        title: str,
+        slope_labels: dict[str, str] | None = None
+    ) -> None:
+        """
+        Plot Model 1 continuous C-peptide fixed effects with simple slopes by arm.
+
+        Args:
+            fixed_effects_df: Model 1 fixed-effects rows with endpoint, term,
+                estimate, ci_lower, ci_upper, and p_value columns.
+            simple_slopes_df: Simple-slope contrast rows with endpoint,
+                treatment_arm, estimate, ci_lower, ci_upper, and p_value columns.
+            figure_endpoints: Endpoints to keep and order in the plotted table.
+            term_labels: Mapping from model term names to display labels.
+            term_order: Ordered display labels for fixed-effect columns.
+            out_path: Destination PNG path.
+            title: Plot title.
+            slope_labels: Optional labels for the reference/comparison
+                C-peptide slopes. Defaults to Standard care and AID.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If either the fixed-effects or simple-slope table has no
+                rows to plot.
+        """
+        fixed_source = fixed_effects_df.copy()
+        fixed_source['estimate_ci'] = fixed_source.apply(
+            lambda row: (
+                f"{row['estimate']:.2f} ({row['ci_lower']:.2f}, {row['ci_upper']:.2f})"
+                if row['term'] == 'Intercept'
+                else (
+                    f"{row['estimate']:.2f} ({row['ci_lower']:.2f}, {row['ci_upper']:.2f})\n"
+                    f"p={row['p_value']}"
+                )
+            ),
+            axis=1
+        )
+        fixed_source['term_label'] = fixed_source['term'].map(term_labels).fillna(fixed_source['term'])
+        fixed_table = (
+            fixed_source.pivot_table(
+                index='endpoint',
+                columns='term_label',
+                values='estimate_ci',
+                aggfunc='first',
+                observed=False
+            )
+            .reindex(index=[e for e in figure_endpoints if e in set(fixed_source['endpoint'])])
+            .reset_index()
+            .rename(columns={'endpoint': 'Endpoint/terms'})
+        )
+        fixed_table = fixed_table[[col for col in term_order if col in fixed_table.columns]]
+        if fixed_table.empty:
+            raise ValueError(f"{title}: fixed-effects table is empty.")
+
+        slope_source = simple_slopes_df.copy()
+        slope_source['slope_ci'] = slope_source.apply(
+            lambda row: (
+                f"{row['estimate']:.2f} ({row['ci_lower']:.2f}, {row['ci_upper']:.2f})\n"
+                f"p={row['p_value']}"
+            ),
+            axis=1
+        )
+        slope_labels = slope_labels or {
+            'control': 'C-peptide slope\nStandard care',
+            'active': 'C-peptide slope\nAID'
+        }
+        slope_source['slope_label'] = slope_source['treatment_arm'].map(slope_labels)
+        slope_table = (
+            slope_source.pivot_table(
+                index='endpoint',
+                columns='slope_label',
+                values='slope_ci',
+                aggfunc='first',
+                observed=False
+            )
+            .reindex(index=[e for e in figure_endpoints if e in set(slope_source['endpoint'])])
+            .reset_index()
+            .rename(columns={'endpoint': 'Endpoint/terms'})
+        )
+        slope_order = ['Endpoint/terms'] + [slope_labels[level] for level in ['control', 'active']]
+        slope_table = slope_table[[col for col in slope_order if col in slope_table.columns]]
+        if slope_table.empty:
+            raise ValueError(f"{title}: simple-slope table is empty.")
+
+        combined_table = fixed_table.merge(slope_table, on='Endpoint/terms', how='left')
+        slope_difference_col = 'AID vs Standard care\nslope difference'
+        combined_column_order = (
+            [col for col in term_order if col in combined_table.columns and col != slope_difference_col] +
+            [col for col in slope_order if col in combined_table.columns and col != 'Endpoint/terms'] +
+            ([slope_difference_col] if slope_difference_col in combined_table.columns else [])
+        )
+        combined_table = combined_table[combined_column_order]
+        if combined_table.empty:
+            raise ValueError(f"{title}: combined fixed-effects and simple-slope table is empty.")
+
+        fixed_color_source = fixed_source.copy()
+        fixed_color_source['p_numeric'] = pd.to_numeric(
+            fixed_color_source['p_value'].astype(str).str.replace('<', '', regex=False),
+            errors='coerce'
+        )
+        fixed_color_source['cell_color'] = np.where(
+            fixed_color_source['p_numeric'] < 0.05,
+            '#d9ead3',
+            '#ffffff'
+        )
+        fixed_color_table = (
+            fixed_color_source.pivot_table(
+                index='endpoint',
+                columns='term_label',
+                values='cell_color',
+                aggfunc='first',
+                observed=False
+            )
+            .reindex(index=[e for e in figure_endpoints if e in set(fixed_color_source['endpoint'])])
+            .reset_index()
+            .rename(columns={'endpoint': 'Endpoint/terms'})
+        )
+        fixed_color_table = fixed_color_table[[col for col in term_order if col in fixed_color_table.columns]]
+        reference_mean_cols = [
+            col for col in fixed_color_table.columns
+            if isinstance(col, str) and col.startswith('Reference mean')
+        ]
+        for col in reference_mean_cols:
+            fixed_color_table[col] = '#ffffff'
+
+        slope_color_source = slope_source.copy()
+        slope_color_source['p_numeric'] = pd.to_numeric(
+            slope_color_source['p_value'].astype(str).str.replace('<', '', regex=False),
+            errors='coerce'
+        )
+        slope_color_source['cell_color'] = np.where(
+            slope_color_source['p_numeric'] < 0.05,
+            '#d9ead3',
+            '#ffffff'
+        )
+        slope_color_table = (
+            slope_color_source.pivot_table(
+                index='endpoint',
+                columns='slope_label',
+                values='cell_color',
+                aggfunc='first',
+                observed=False
+            )
+            .reindex(index=[e for e in figure_endpoints if e in set(slope_color_source['endpoint'])])
+            .reset_index()
+            .rename(columns={'endpoint': 'Endpoint/terms'})
+        )
+        slope_color_table = slope_color_table[[col for col in slope_order if col in slope_color_table.columns]]
+        combined_color_table = fixed_color_table.merge(slope_color_table, on='Endpoint/terms', how='left')
+        combined_color_table['Endpoint/terms'] = '#ffffff'
+        combined_color_table = combined_color_table.reindex(columns=combined_table.columns)
+
+        self.plot_dataframe_table(
+            combined_table,
+            out_path,
+            title,
+            font_size=6,
+            cell_colors=combined_color_table
+        )
 
     def plot_feature_charts(self, mat, features: list, df_name: str) -> None:
         """
@@ -3758,6 +4894,102 @@ class DataAnalysis:
         plt.tight_layout()
         plt.savefig(path) #Change this for the T1D group
         plt.close()
+
+    def plot_lmm_adjusted_means_by_stratum(
+        self,
+        plot_df: pd.DataFrame,
+        dataset_name: str,
+        endpoints_to_plot: list[str],
+        stratum_labels: dict[int, str],
+        arm_labels: dict[str, str],
+        arm_order: list[str],
+        arm_colors: dict[str, str],
+        path: Path
+    ) -> None:
+        ncols = min(3, len(endpoints_to_plot))
+        nrows = math.ceil(len(endpoints_to_plot) / ncols)
+        fig, axes = plt.subplots(
+            nrows=nrows,
+            ncols=ncols,
+            figsize=(5.0 * ncols, 3.8 * nrows),
+            squeeze=False
+        )
+        is_single_endpoint = len(endpoints_to_plot) == 1
+        fig.subplots_adjust(
+            top=0.72 if is_single_endpoint else 0.82,
+            hspace=0.55,
+            wspace=0.22
+        )
+
+        for idx, endpoint in enumerate(endpoints_to_plot):
+            ax = axes[idx // ncols, idx % ncols]
+            endpoint_df = plot_df[plot_df['endpoint'] == endpoint].copy()
+            endpoint_df['_cpep_stratum_num'] = pd.to_numeric(
+                endpoint_df['cpep_stratum'],
+                errors='coerce'
+            )
+            strata = [
+                s for s in [1, 2, 3, 4]
+                if s in set(endpoint_df['_cpep_stratum_num'].dropna().astype(int))
+            ]
+            x = np.arange(len(strata))
+            offset = 0.08
+
+            for arm_idx, arm in enumerate(arm_order):
+                arm_df = (
+                    endpoint_df[endpoint_df['treatment_arm'] == arm]
+                    .assign(_cpep_stratum_num=lambda d: d['_cpep_stratum_num'].astype('Int64'))
+                    .set_index('_cpep_stratum_num')
+                    .reindex(strata)
+                )
+                means = arm_df['emmeans'].astype(float)
+                ci_lower = arm_df['ci_lower'].astype(float)
+                ci_upper = arm_df['ci_upper'].astype(float)
+                valid = means.notna() & ci_lower.notna() & ci_upper.notna()
+                yerr = np.vstack([
+                    (means[valid] - ci_lower[valid]).clip(lower=0),
+                    (ci_upper[valid] - means[valid]).clip(lower=0)
+                ])
+                ax.errorbar(
+                    x[valid.to_numpy()] + (arm_idx - 0.5) * offset * 2,
+                    means[valid],
+                    yerr=yerr,
+                    fmt='o',
+                    markersize=5,
+                    linewidth=1.2,
+                    elinewidth=1.2,
+                    capsize=3,
+                    label=arm_labels[arm],
+                    color=arm_colors[arm],
+                    alpha=0.95
+                )
+
+            ax.set_title(FEATURE_LABELS_WITH_UNITS.get(endpoint, endpoint), fontsize=10, pad=10)
+            ax.set_xticks(x)
+            ax.set_xticklabels([stratum_labels[s] for s in strata])
+            ax.set_xlabel('C-peptide AUC stratum')
+            ax.set_ylabel('Model-adjusted mean')
+            ax.grid(axis='y', alpha=0.25)
+
+        for idx in range(len(endpoints_to_plot), nrows * ncols):
+            axes[idx // ncols, idx % ncols].axis('off')
+
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            loc='upper center',
+            bbox_to_anchor=(0.5, 0.86 if is_single_endpoint else 0.91),
+            ncol=2,
+            frameon=False
+        )
+        fig.suptitle(
+            f'{dataset_name}: model-adjusted means by C-peptide stratum',
+            y=0.97,
+            fontsize=11
+        )
+        fig.savefig(path, dpi=300, bbox_inches='tight', pad_inches=0.08)
+        plt.close(fig)
 
     def plot_spearman_heatmap_from_dfs(
         self,
@@ -4079,13 +5311,12 @@ class DataAnalysis:
 
         return summary
 
-    def plot_taylor_time_bins_graph(self, dict_df: dict[str, pd.DataFrame], metrics: list[str], path: str) -> None:
+    def plot_taylor_time_bins_graph(self, df: pd.DataFrame, metrics: list[str], path: str) -> None:
         """
         Plot Taylor-style dependent metrics across time bins, stratified by treatment arm.
 
         Args:
-            dict_df (dict[str, pd.DataFrame]): Mapping of study name to DataFrame used to
-                compute dependent metrics (patient-level summaries).
+            df: DataFrame used to compute dependent metrics (patient-level summaries).
             path (str): Directory path where individual metric figures will be saved.
 
         Returns:
@@ -4095,7 +5326,7 @@ class DataAnalysis:
             'Baseline', 'Month 3', 'Month 6', 'Month 9', 'Month 12',
             'Month 15', 'Month 18', 'Month 21', 'Month 24'
         ]
-        df_all = pd.concat(dict_df.values(), ignore_index=True)
+        df_all = df.copy()
         df_all['time_bin'] = pd.Categorical(df_all['time_bin'], categories=time_order, ordered=True)
         df_results = self.get_taylor_patient_endpoints(
             df_all,
@@ -4179,7 +5410,7 @@ class DataAnalysis:
 
     def plot_taylor_time_bins_scatterplot(
         self,
-        dict_df: dict[str, pd.DataFrame],
+        df: pd.DataFrame,
         x_feature: str,
         y_features: list[str],
         path: str
@@ -4188,7 +5419,7 @@ class DataAnalysis:
         Draw faceted regression scatterplots for selected features across key time bins.
 
         Args:
-            dict_df (dict[str, pd.DataFrame]): Mapping of study name to DataFrame.
+            df: DataFrame containing Taylor time-bin rows.
             x_feature (str): Feature to use on the x-axis for regression.
             y_features (list[str]): Features to plot on the y-axis.
             path (str): Directory path for saving output PNGs.
@@ -4202,9 +5433,8 @@ class DataAnalysis:
         time_bins_to_include = ['Baseline', 'Month 6', 'Month 12']
 
         # Preprocess and flatten patient-level data
-        all_df = pd.concat(dict_df.values(), ignore_index=True).copy()
+        all_df = df.copy()
         all_df['log_cpep_auc'] = np.log1p(all_df['cpep_auc'])
-        all_df['total_ins_dose'] = all_df['total_ins_dose']/all_df['weight']
 
         # Compute TIR per patient per time_bin
         tir_records = []
@@ -4295,12 +5525,28 @@ class DataAnalysis:
         dict_dfs = self.datasets.copy()
         dfs_to_check = {name: dict_dfs[name] for name in df_names if name in dict_dfs}
         fail_records = []
+        summary_records_by_study = {}
+        all_summary_records = []
 
         def expected_entries(days: int, interval_minutes: float) -> float:
             """Compute expected CGM rows for a window given the sampling interval."""
             if pd.isna(interval_minutes) or interval_minutes <= 0:
                 return 0
             return (days * 24 * 60) / interval_minutes
+
+        def _time_bin_sort_value(value: str) -> float:
+            value = str(value)
+            if value == 'Baseline':
+                return 0
+            match = re.search(r'Month\s+(\d+)', value)
+            if match:
+                return float(match.group(1))
+            return float('inf')
+
+        def _sort_summary_by_time_bin(df: pd.DataFrame, by_study: bool = False) -> pd.DataFrame:
+            sort_df = df.assign(_time_bin_sort=df['time_bin'].map(_time_bin_sort_value))
+            sort_cols = ['study', '_time_bin_sort', 'time_bin'] if by_study else ['_time_bin_sort', 'time_bin']
+            return sort_df.sort_values(by=sort_cols).drop(columns=['_time_bin_sort'])
 
         def best_consecutive_window(day_counts: pd.Series, window_days: int) -> tuple[bool, int]:
             """
@@ -4344,12 +5590,10 @@ class DataAnalysis:
             df_cgm = df_cgm.sort_values(['id', 'time_bin', 'timestamp'])
 
             total_subjects = df_cgm['id'].nunique()
-            print(f"\n=== {df_name} ===")
-            print(f"Subjects with CGM entries: {total_subjects}")
+            summary_records_by_study[df_name] = []
 
             for time_bin, bin_df in df_cgm.groupby('time_bin'):
                 bin_ids = bin_df['id'].unique()
-                print(f"\nTime bin: {time_bin} | subjects: {len(bin_ids)}")
 
                 ids_with_14 = set()
                 ids_with_10 = set()
@@ -4420,15 +5664,38 @@ class DataAnalysis:
                                 'wear_pct': round(wear_10, 2)
                             })
 
-                print(f"Subjects with >=14 consecutive days: {len(ids_with_14)}")
-                print(f"Subjects with >=10 consecutive days: {len(ids_with_10)}")
-                print(f"Subjects meeting 70% wear over best 14-day window: {len(passed_14_wear)}")
-                print(f"Subjects (no 14-day streak) meeting 80% wear over 10 days: {len(passed_10_fallback)}")
+                summary_records_by_study[df_name].append({
+                    'study': df_name,
+                    'time_bin': time_bin,
+                    'subjects_with_cgm_entries': total_subjects,
+                    'time_bin_subjects': len(bin_ids),
+                    'subjects_with_14_consecutive_days': len(ids_with_14),
+                    'subjects_with_10_consecutive_days': len(ids_with_10),
+                    'subjects_meeting_70pct_wear_best_14_day_window': len(passed_14_wear),
+                    'subjects_no_14_day_streak_meeting_80pct_wear_over_10_days': len(passed_10_fallback),
+                })
+
+            if summary_records_by_study[df_name]:
+                all_summary_records.extend(summary_records_by_study[df_name])
+                summary_df = pd.DataFrame(summary_records_by_study[df_name])
+                summary_df = _sort_summary_by_time_bin(summary_df)
+                output_path = Path("./data/csv_results/cgm_wear") / df_name / "results.csv"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                summary_df.to_csv(output_path, index=False)
+                print(f"Saved CGM wear summary for {df_name} to {output_path}")
+
+        if all_summary_records:
+            all_summary_df = pd.DataFrame(all_summary_records)
+            all_summary_df = _sort_summary_by_time_bin(all_summary_df, by_study=True)
+            output_path = Path("./data/csv_results/cgm_wear/results.csv")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            all_summary_df.to_csv(output_path, index=False)
+            print(f"Saved combined CGM wear summary to {output_path}")
 
         if fail_records:
             fail_df = pd.DataFrame(fail_records)
             fail_df.sort_values(by=['study', 'time_bin', 'id'], inplace=True)
-            output_path = Path("./data/cgm_wear_failures.csv")
+            output_path = Path("./data/csv_results/cgm_wear/cgm_wear_failures.csv")
             output_path.parent.mkdir(parents=True, exist_ok=True)
             fail_df.to_csv(output_path, index=False)
             print(f"\nSaved CGM wear failures across all studies to {output_path}")
@@ -4532,7 +5799,7 @@ class DataAnalysis:
         healthy_reference_pd = healthy_reference.compute()
         established_reference_pd = established_reference.compute()
 
-        quantile_features = ['cv_percent', 'beta2_score', 'cpep_auc_preservation', 'cpep_auc', 'hb_a1c', 'TIR', 'TITR']
+        quantile_features = ['cv_percent', 'beta2_score', 'cpep_auc', 'hb_a1c', 'TIR', 'TITR']
         # quantile_features = ['beta2_score']
         for study_name, df in all_dict.items():
             df = df.compute()
@@ -4577,9 +5844,98 @@ class DataAnalysis:
                     quantile_feature=quantile_feature,
                     arm_label='AID',
                     arm_values=TREATMENT_GROUP_2,
-                    arm_color="#e5f500",
+                    arm_color="#F58518",
                     path=f'./data/graphs/feature_analysis/AGP/{study_name}/{quantile_feature}/curves_only_aid/combined.png'
                 )
+
+    def print_workstream_2_AGP(
+        self,
+        graph_output_root: str | Path = './data/graphs/workstream_2/task_4_agp'
+    ) -> None:
+        """
+        Generate Workstream 2 AGPs for CLOUD/CLVR C-peptide strata and references.
+
+        Outputs:
+            - CLOUD, CLVR, and CLOUD_CLVR AGP curves stratified by C-peptide AUC.
+            - Standalone reference AGP median curves for JAEB healthy and HUPA.
+
+        Raises:
+            ValueError: If required datasets or AGP source columns are missing.
+        """
+        required_datasets = {'cloud', 'clvr', 'jaeb_healthy', 'hupa_ucm'}
+        missing_datasets = required_datasets - set(self.datasets)
+        if missing_datasets:
+            raise ValueError(f"Workstream 2 AGP requires missing datasets: {sorted(missing_datasets)}")
+
+        graph_output_root = Path(graph_output_root)
+        dict_dfs = self.datasets.copy()
+
+        df_cloud = dict_dfs['cloud'].compute() if isinstance(dict_dfs['cloud'], dd.DataFrame) else dict_dfs['cloud'].copy()
+        df_clvr = dict_dfs['clvr'].compute() if isinstance(dict_dfs['clvr'], dd.DataFrame) else dict_dfs['clvr'].copy()
+        df_healthy = (
+            dict_dfs['jaeb_healthy'].compute()
+            if isinstance(dict_dfs['jaeb_healthy'], dd.DataFrame)
+            else dict_dfs['jaeb_healthy'].copy()
+        )
+        df_hupa = (
+            dict_dfs['hupa_ucm'].compute()
+            if isinstance(dict_dfs['hupa_ucm'], dd.DataFrame)
+            else dict_dfs['hupa_ucm'].copy()
+        )
+
+        df_clvr = (
+            df_clvr
+            .drop(columns=['treatment_arm'], errors='ignore')
+            .rename(columns={'insulin_delivery': 'treatment_arm'})
+        )
+        df_cloud_clvr = pd.concat(
+            [
+                df_cloud.assign(study='cloud'),
+                df_clvr.assign(study='clvr')
+            ],
+            ignore_index=True
+        )
+
+        agp_datasets = {
+            'cloud': df_cloud,
+            'clvr': df_clvr,
+            'cloud_clvr': df_cloud_clvr
+        }
+        quantile_feature = 'cpep_auc'
+
+        for study_name, df in agp_datasets.items():
+            required_cols = {'id', 'timestamp', 'glucose mmol/l', 'treatment_arm', quantile_feature}
+            missing_cols = required_cols - set(df.columns)
+            if missing_cols:
+                raise ValueError(f"{study_name} Workstream 2 AGP is missing columns: {sorted(missing_cols)}")
+
+            curves_dir = graph_output_root / study_name / quantile_feature / 'curves_only'
+            self.plot_AGP_quartiles_curves_only(
+                df,
+                healthy_reference=df_healthy,
+                established_reference=df_hupa,
+                quantile_feature=quantile_feature,
+                path=str(curves_dir)
+            )
+            self.combine_pngs(
+                directory=str(curves_dir),
+                output=str(curves_dir / 'combined.png'),
+                cols=2,
+                include_filter='curves_only_'
+            )
+
+        self.plot_AGP_reference_curve(
+            df_healthy,
+            label='JAEB Healthy',
+            color="#00f514",
+            path=graph_output_root / 'references' / 'jaeb_healthy_agp.png'
+        )
+        self.plot_AGP_reference_curve(
+            df_hupa,
+            label='HUPA',
+            color="#f50000",
+            path=graph_output_root / 'references' / 'hupa_ucm_agp.png'
+        )
 
     def print_consort_general(
             self,
@@ -4706,10 +6062,541 @@ class DataAnalysis:
             print("\nAll counts are based on unique patient IDs.\n")
 
         return None
+
+    def _get_ids_from_csv_file(
+            self,
+            path: Path,
+            study_name: str,
+            required_nonempty_columns: set[str] | None = None
+        ) -> set[str]:
+        """
+        Return unique participant IDs from a CSV file.
+
+        Args:
+            path: CSV file containing an `id` column.
+            study_name: Study name used to canonicalize IDs before comparison.
+            required_nonempty_columns: Optional columns where at least one must
+                be non-empty for a row to count.
+
+        Returns:
+            set[str]: Unique non-empty participant IDs.
+
+        Raises:
+            FileNotFoundError: If `path` does not exist.
+            ValueError: If the CSV does not contain `id`, or if requested
+                value columns are absent.
+        """
+        if not path.exists():
+            raise FileNotFoundError(f"CONSORT source file not found: {path}")
+
+        df = pd.read_csv(path)
+        if 'id' not in df.columns:
+            raise ValueError(f"CONSORT source file has no 'id' column: {path}")
+
+        if required_nonempty_columns:
+            available_value_cols = [col for col in required_nonempty_columns if col in df.columns]
+            if not available_value_cols:
+                raise ValueError(
+                    f"None of the required columns {sorted(required_nonempty_columns)} "
+                    f"were found in {path}. Available columns: {list(df.columns)}"
+                )
+            value_df = df[available_value_cols].replace(r'^\s*$', np.nan, regex=True)
+            df = df[value_df.notna().any(axis=1)]
+
+        return {
+            self._canonical_consort_id(study_name, subject_id)
+            for subject_id in df['id'].dropna().astype(str).unique()
+        }
+
+    def _canonical_consort_id(self, study_name: str, subject_id: str) -> str:
+        """
+        Canonicalize participant IDs for source/final CONSORT comparisons.
+
+        Some final datasets add study prefixes that are absent from the cleaned
+        source-domain files. The returned key always includes the study name so
+        same-looking IDs from different studies cannot collide.
+
+        Args:
+            study_name: Study key.
+            subject_id: Participant ID from a source or final dataset.
+
+        Returns:
+            str: Study-scoped canonical participant key.
+        """
+        subject_id = str(subject_id).strip()
+        if study_name == 'clvr' and subject_id.startswith('CLVR_'):
+            subject_id = subject_id.removeprefix('CLVR_')
+        if study_name == 'diagnode' and subject_id.startswith('Diagnode_'):
+            subject_id = subject_id.removeprefix('Diagnode_')
+        return f'{study_name}::{subject_id}'
+
+    def _get_original_source_ids(self, study_names: list[str]) -> set[str]:
+        """
+        Return the union of participant IDs found in all df_original files.
+
+        Args:
+            study_names: Study folders to scan under `data/studies`.
+
+        Returns:
+            set[str]: Unique participant IDs from all source-domain files.
+
+        Raises:
+            FileNotFoundError: If a study has no `df_original.csv` files.
+        """
+        all_ids = set()
+        for study_name in study_names:
+            csv_root = Path('./data/studies') / study_name / 'csv_files'
+            original_paths = sorted(csv_root.glob('*/df_original.csv'))
+            if not original_paths:
+                raise FileNotFoundError(
+                    f"No df_original.csv files found for CONSORT study '{study_name}' under {csv_root}."
+                )
+            for path in original_paths:
+                all_ids |= self._get_ids_from_csv_file(path, study_name)
+        return all_ids
+
+    def _get_clean_feature_ids(
+            self,
+            study_names: list[str],
+            feature_folders: list[str],
+            required_nonempty_columns: set[str] | None = None
+        ) -> set[str]:
+        """
+        Return IDs from cleaned feature-domain files.
+
+        Args:
+            study_names: Study folders to scan under `data/studies`.
+            feature_folders: Candidate feature folder names, e.g. `cgm`,
+                `height_weight`, or `weight_height`.
+            required_nonempty_columns: Optional columns where at least one must
+                be non-empty for a row to count.
+
+        Returns:
+            set[str]: Unique participant IDs across matching clean files.
+
+        Raises:
+            FileNotFoundError: If none of the requested feature folders exist for
+                a study.
+        """
+        all_ids = set()
+        missing = []
+        for study_name in study_names:
+            matched_paths = []
+            for feature_folder in feature_folders:
+                path = Path('./data/studies') / study_name / 'csv_files' / feature_folder / 'df_clean.csv'
+                if path.exists():
+                    matched_paths.append(path)
+            if not matched_paths:
+                missing.append(study_name)
+                continue
+
+            for path in matched_paths:
+                all_ids |= self._get_ids_from_csv_file(path, study_name, required_nonempty_columns)
+
+        if missing:
+            raise FileNotFoundError(
+                "Missing requested CONSORT clean feature files for studies: "
+                f"{missing}. Feature folders checked: {feature_folders}"
+            )
+        return all_ids
+
+    def _get_final_dataset_ids(
+            self,
+            study_names: list[str],
+            required_nonempty_columns: set[str] | None = None
+        ) -> set[str]:
+        """
+        Return participant IDs from loaded final datasets.
+
+        Args:
+            study_names: Loaded dataset keys.
+            required_nonempty_columns: Optional columns where at least one must
+                be non-empty for a row to count.
+
+        Returns:
+            set[str]: Unique participant IDs.
+
+        Raises:
+            ValueError: If required columns are absent from a final dataset.
+        """
+        all_ids = set()
+        for study_name in study_names:
+            df = self.get_dataset(study_name)
+            if 'id' not in df.columns:
+                raise ValueError(f"Final dataset '{study_name}' has no 'id' column.")
+
+            if required_nonempty_columns:
+                available_value_cols = [col for col in required_nonempty_columns if col in df.columns]
+                if not available_value_cols:
+                    raise ValueError(
+                        f"None of the required columns {sorted(required_nonempty_columns)} "
+                        f"were found in final dataset '{study_name}'. Available columns: {list(df.columns)}"
+                    )
+                value_df = df[available_value_cols].replace(r'^\s*$', np.nan, regex=True)
+                df = df[value_df.notna().any(axis=1)]
+
+            all_ids |= {
+                self._canonical_consort_id(study_name, subject_id)
+                for subject_id in df['id'].dropna().astype(str).unique()
+            }
+        return all_ids
+
+    def _save_consort_flow_plot(
+            self,
+            boxes: list[dict],
+            arrows: list[tuple[str, str]],
+            title: str,
+            output_path: str | Path
+        ) -> None:
+        """
+        Save a CONSORT-style box-and-arrow plot from positioned box specs.
+
+        Args:
+            boxes: List of dictionaries with `key`, `x`, `y`, and `text`.
+            arrows: Source/target key pairs.
+            title: Figure title.
+            output_path: PNG output path.
+
+        Returns:
+            None: Saves the figure to disk.
+
+        Raises:
+            ValueError: If duplicate box keys or invalid arrows are supplied.
+        """
+        box_by_key = {}
+        for box in boxes:
+            key = box['key']
+            if key in box_by_key:
+                raise ValueError(f"Duplicate CONSORT box key: {key}")
+            box_by_key[key] = box
+
+        for source, target in arrows:
+            if source not in box_by_key or target not in box_by_key:
+                raise ValueError(f"Invalid CONSORT arrow: {source} -> {target}")
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        fig, ax = plt.subplots(figsize=(13, 9))
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+        ax.set_title(title, fontsize=16, pad=18)
+
+        for source, target in arrows:
+            source_box = box_by_key[source]
+            target_box = box_by_key[target]
+            ax.annotate(
+                '',
+                xy=(target_box['x'], target_box['y'] + 0.055),
+                xytext=(source_box['x'], source_box['y'] - 0.055),
+                arrowprops={
+                    'arrowstyle': '->',
+                    'color': '#555555',
+                    'lw': 1.2,
+                    'shrinkA': 8,
+                    'shrinkB': 8,
+                    'connectionstyle': 'angle3'
+                }
+            )
+
+        for box in boxes:
+            ax.text(
+                box['x'],
+                box['y'],
+                box['text'],
+                ha='center',
+                va='center',
+                fontsize=10,
+                linespacing=1.25,
+                bbox={
+                    'boxstyle': 'round,pad=0.45,rounding_size=0.02',
+                    'facecolor': box.get('facecolor', '#eef3f5'),
+                    'edgecolor': '#606060',
+                    'linewidth': 0.9
+                }
+            )
+
+        fig.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+    def build_workstream_1_consort_graph(
+            self,
+            study_names: list[str] | None = None,
+            csv_output_path: str | Path = './data/csv_results/workstream_1/consort/workstream_1_consort_counts.csv',
+            graph_output_path: str | Path = './data/graphs/workstream_1/consort/workstream_1_consort.png'
+        ) -> None:
+        """
+        Build a CONSORT-style flow for the whole-dataset CGM/C-peptide analysis.
+
+        The primary vertical flow is:
+        original source participants -> cleaned CGM -> cleaned C-peptide ->
+        age available -> primary CGM/C-peptide cohort. Age availability uses
+        cleaned source age files plus final datasets, because some studies carry
+        age into `df_final` while others store it in height/weight or extra files.
+
+        Weight and insulin are shown as an insulin-ready subset branching from
+        the primary cohort, because insulin is not required for the core
+        Workstream 1 C-peptide/CGM models.
+
+        Args:
+            study_names: Studies to include. Defaults to WORKSTREAM_1_STUDIES.
+            csv_output_path: CSV output for auditable participant counts.
+            graph_output_path: PNG output for the CONSORT-style graph.
+
+        Returns:
+            None: Saves the count CSV and graph.
+        """
+        study_names = WORKSTREAM_1_STUDIES if study_names is None else study_names
+        original_ids = self._get_original_source_ids(study_names)
+        cgm_ids = original_ids & self._get_clean_feature_ids(study_names, ['cgm'])
+        cpep_ids = cgm_ids & self._get_clean_feature_ids(study_names, ['cpep'])
+
+        age_frames = []
+        for study_name in study_names:
+            df = self.get_dataset(study_name)
+            if 'age' in df.columns:
+                df = df.copy()
+                df['_consort_id'] = df['id'].astype(str).map(
+                    lambda subject_id: self._canonical_consort_id(study_name, subject_id)
+                )
+                age_frames.append(df[['_consort_id', 'age']])
+
+            for feature_folder in ['height_weight', 'weight_height', 'extra']:
+                path = Path('./data/studies') / study_name / 'csv_files' / feature_folder / 'df_clean.csv'
+                if not path.exists():
+                    continue
+                df_clean = pd.read_csv(path)
+                if 'age' not in df_clean.columns:
+                    continue
+                df_clean = df_clean.copy()
+                df_clean['_consort_id'] = df_clean['id'].astype(str).map(
+                    lambda subject_id: self._canonical_consort_id(study_name, subject_id)
+                )
+                age_frames.append(df_clean[['_consort_id', 'age']])
+
+        if not age_frames:
+            raise ValueError("Workstream 1 CONSORT could not find age in clean source files or final datasets.")
+
+        age_df = pd.concat(age_frames, ignore_index=True)
+        age_df['age_numeric'] = pd.to_numeric(age_df['age'], errors='coerce')
+        age_by_id = (
+            age_df
+            .dropna(subset=['_consort_id', 'age_numeric'])
+            .groupby('_consort_id')['age_numeric']
+            .first()
+        )
+        age_source_ids = set(age_by_id.index.astype(str))
+        age_ids = cpep_ids & age_source_ids
+        weight_ids = age_ids & self._get_clean_feature_ids(
+            study_names,
+            ['height_weight', 'weight_height'],
+            {'weight'}
+        )
+        insulin_ids = weight_ids & self._get_clean_feature_ids(study_names, ['insulin'])
+
+        pediatric_ids = set(age_by_id[age_by_id < 18].index.astype(str)) & age_ids
+        adult_ids = set(age_by_id[age_by_id >= 18].index.astype(str)) & age_ids
+        if pediatric_ids | adult_ids != age_ids:
+            raise ValueError(
+                "Workstream 1 CONSORT age split does not cover every age-available participant. "
+                f"Age-available n={len(age_ids)}, split n={len(pediatric_ids | adult_ids)}."
+            )
+
+        rows = [
+            {'step': 'original_source_participants', 'n': len(original_ids), 'excluded_since_previous': 0},
+            {'step': 'cleaned_cgm_available', 'n': len(cgm_ids), 'excluded_since_previous': len(original_ids - cgm_ids)},
+            {'step': 'cpep_available_after_cgm', 'n': len(cpep_ids), 'excluded_since_previous': len(cgm_ids - cpep_ids)},
+            {'step': 'age_available_after_cgm_cpep', 'n': len(age_ids), 'excluded_since_previous': len(cpep_ids - age_ids)},
+            {'step': 'primary_cgm_cpep_cohort', 'n': len(age_ids), 'excluded_since_previous': 0},
+            {'step': 'pediatric_primary_cohort_age_under_18', 'n': len(pediatric_ids), 'excluded_since_previous': np.nan},
+            {'step': 'adult_primary_cohort_age_18_plus', 'n': len(adult_ids), 'excluded_since_previous': np.nan},
+            {'step': 'weight_available_primary_subset', 'n': len(weight_ids), 'excluded_since_previous': len(age_ids - weight_ids)},
+            {'step': 'has_weight_and_insulin_data', 'n': len(insulin_ids), 'excluded_since_previous': len(weight_ids - insulin_ids)}
+        ]
+        csv_output_path = Path(csv_output_path)
+        csv_output_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(csv_output_path, index=False)
+
+        boxes = [
+            {'key': 'original', 'x': 0.50, 'y': 0.92, 'text': f"All unique participants\nin source files\nn={len(original_ids)}"},
+            {'key': 'cgm', 'x': 0.50, 'y': 0.78, 'text': f"Cleaned CGM available\nn={len(cgm_ids)}\nExcluded: {len(original_ids - cgm_ids)}"},
+            {'key': 'cpep', 'x': 0.50, 'y': 0.64, 'text': f"C-peptide available\nn={len(cpep_ids)}\nExcluded: {len(cgm_ids - cpep_ids)}"},
+            {'key': 'age', 'x': 0.50, 'y': 0.50, 'text': f"Age available\nn={len(age_ids)}\nExcluded: {len(cpep_ids - age_ids)}"},
+            {'key': 'primary', 'x': 0.50, 'y': 0.36, 'text': f"Primary CGM/C-peptide\nanalysis cohort\nn={len(age_ids)}"},
+            {'key': 'pediatric', 'x': 0.28, 'y': 0.18, 'text': f"Pediatric cohort\nage <18\nn={len(pediatric_ids)}"},
+            {'key': 'adult', 'x': 0.72, 'y': 0.18, 'text': f"Adult cohort\nage >=18\nn={len(adult_ids)}"},
+            {'key': 'weight', 'x': 0.84, 'y': 0.50, 'text': f"Weight available\nsubset\nn={len(weight_ids)}\nExcluded: {len(age_ids - weight_ids)}", 'facecolor': '#f5f0df'},
+            {'key': 'insulin', 'x': 0.84, 'y': 0.36, 'text': f"Has weight +\ninsulin data\nn={len(insulin_ids)}\nExcluded: {len(weight_ids - insulin_ids)}", 'facecolor': '#f5f0df'}
+        ]
+        arrows = [
+            ('original', 'cgm'),
+            ('cgm', 'cpep'),
+            ('cpep', 'age'),
+            ('age', 'primary'),
+            ('primary', 'pediatric'),
+            ('primary', 'adult'),
+            ('age', 'weight'),
+            ('weight', 'insulin')
+        ]
+        self._save_consort_flow_plot(
+            boxes,
+            arrows,
+            'Workstream 1 Participant Flow',
+            graph_output_path
+        )
+        return None
+
+    def build_workstream_2_consort_graph(
+            self,
+            study_names: list[str] | None = None,
+            csv_output_path: str | Path = './data/csv_results/workstream_2/consort/workstream_2_consort_counts.csv',
+            graph_output_path: str | Path = './data/graphs/workstream_2/consort/workstream_2_consort.png'
+        ) -> None:
+        """
+        Build a CONSORT-style flow for the CLOUD/CLVR treatment-arm analyses.
+
+        The flow is:
+        source participants -> cleaned CGM -> cleaned C-peptide -> treatment arm
+        available -> Workstream 2 cohort, followed by AID/standard-care counts.
+        For CLVR, `insulin_delivery` is used for the treatment split because
+        Workstream 2 focuses on AID versus standard care rather than
+        verapamil/placebo assignment.
+
+        Args:
+            study_names: Studies to include. Defaults to WORKSTREAM_2_STUDIES.
+            csv_output_path: CSV output for auditable participant counts.
+                A by-study count CSV is also saved beside this file.
+            graph_output_path: PNG output for the CONSORT-style graph.
+
+        Returns:
+            None: Saves the count CSV and graph.
+        """
+        study_names = WORKSTREAM_2_STUDIES if study_names is None else study_names
+        original_ids = self._get_original_source_ids(study_names)
+        cgm_ids = original_ids & self._get_clean_feature_ids(study_names, ['cgm'])
+        cpep_ids = cgm_ids & self._get_clean_feature_ids(study_names, ['cpep'])
+
+        treatment_frames = []
+        for study_name in study_names:
+            df = self.get_dataset(study_name)
+            treatment_col = 'insulin_delivery' if study_name == 'clvr' and 'insulin_delivery' in df.columns else 'treatment_arm'
+            if treatment_col not in df.columns:
+                raise ValueError(
+                    f"Final dataset '{study_name}' has no '{treatment_col}' column for Workstream 2 CONSORT."
+                )
+            df = df.copy()
+            df['_consort_id'] = df['id'].astype(str).map(
+                lambda subject_id: self._canonical_consort_id(study_name, subject_id)
+            )
+            treatment_frames.append(
+                df[df['_consort_id'].isin(cpep_ids)][['_consort_id', treatment_col]]
+                .rename(columns={treatment_col: 'treatment_arm'})
+            )
+        treatment_df = pd.concat(treatment_frames, ignore_index=True)
+        treatment_df['treatment_arm_clean'] = (
+            treatment_df['treatment_arm']
+            .replace(r'^\s*$', np.nan, regex=True)
+            .astype(str)
+            .str.lower()
+            .str.strip()
+        )
+        treatment_df = treatment_df[treatment_df['treatment_arm_clean'] != 'nan']
+        treatment_by_id = (
+            treatment_df
+            .dropna(subset=['_consort_id', 'treatment_arm_clean'])
+            .groupby('_consort_id')['treatment_arm_clean']
+            .agg(lambda values: values.mode().iloc[0] if not values.mode().empty else values.iloc[0])
+        )
+        treatment_ids = set(treatment_by_id.index.astype(str)) & cpep_ids
+        control_ids = set(treatment_by_id[treatment_by_id.isin(TREATMENT_GROUP_1)].index.astype(str)) & treatment_ids
+        active_ids = set(treatment_by_id[treatment_by_id.isin(TREATMENT_GROUP_2)].index.astype(str)) & treatment_ids
+        unmapped_ids = treatment_ids - control_ids - active_ids
+        if unmapped_ids:
+            raise ValueError(
+                "Workstream 2 CONSORT found treatment arms outside known control/active groups "
+                f"for ids: {sorted(unmapped_ids)}"
+            )
+
+        weight_ids = treatment_ids & self._get_clean_feature_ids(
+            study_names,
+            ['height_weight', 'weight_height'],
+            {'weight'}
+        )
+        insulin_ids = weight_ids & self._get_clean_feature_ids(study_names, ['insulin'])
+
+        rows = [
+            {'step': 'original_source_participants', 'n': len(original_ids), 'excluded_since_previous': 0},
+            {'step': 'cleaned_cgm_available', 'n': len(cgm_ids), 'excluded_since_previous': len(original_ids - cgm_ids)},
+            {'step': 'cpep_available_after_cgm', 'n': len(cpep_ids), 'excluded_since_previous': len(cgm_ids - cpep_ids)},
+            {'step': 'treatment_arm_available_after_cgm_cpep', 'n': len(treatment_ids), 'excluded_since_previous': len(cpep_ids - treatment_ids)},
+            {'step': 'workstream_2_analysis_cohort', 'n': len(treatment_ids), 'excluded_since_previous': 0},
+            {'step': 'control_arm_cohort', 'n': len(control_ids), 'excluded_since_previous': np.nan},
+            {'step': 'active_arm_cohort', 'n': len(active_ids), 'excluded_since_previous': np.nan},
+            {'step': 'weight_available_treatment_subset', 'n': len(weight_ids), 'excluded_since_previous': len(treatment_ids - weight_ids)},
+            {'step': 'has_weight_and_insulin_data', 'n': len(insulin_ids), 'excluded_since_previous': len(weight_ids - insulin_ids)}
+        ]
+        csv_output_path = Path(csv_output_path)
+        csv_output_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(csv_output_path, index=False)
+        by_study_rows = []
+        for study_name in study_names:
+            study_original_ids = {subject_id for subject_id in original_ids if subject_id.startswith(f'{study_name}::')}
+            study_cgm_ids = {subject_id for subject_id in cgm_ids if subject_id.startswith(f'{study_name}::')}
+            study_cpep_ids = {subject_id for subject_id in cpep_ids if subject_id.startswith(f'{study_name}::')}
+            study_treatment_ids = {subject_id for subject_id in treatment_ids if subject_id.startswith(f'{study_name}::')}
+            study_control_ids = {subject_id for subject_id in control_ids if subject_id.startswith(f'{study_name}::')}
+            study_active_ids = {subject_id for subject_id in active_ids if subject_id.startswith(f'{study_name}::')}
+            study_weight_ids = {subject_id for subject_id in weight_ids if subject_id.startswith(f'{study_name}::')}
+            study_insulin_ids = {subject_id for subject_id in insulin_ids if subject_id.startswith(f'{study_name}::')}
+            by_study_rows.extend([
+                {'study': study_name, 'step': 'original_source_participants', 'n': len(study_original_ids), 'excluded_since_previous': 0},
+                {'study': study_name, 'step': 'cleaned_cgm_available', 'n': len(study_cgm_ids), 'excluded_since_previous': len(study_original_ids - study_cgm_ids)},
+                {'study': study_name, 'step': 'cpep_available_after_cgm', 'n': len(study_cpep_ids), 'excluded_since_previous': len(study_cgm_ids - study_cpep_ids)},
+                {'study': study_name, 'step': 'treatment_arm_available_after_cgm_cpep', 'n': len(study_treatment_ids), 'excluded_since_previous': len(study_cpep_ids - study_treatment_ids)},
+                {'study': study_name, 'step': 'control_arm_cohort', 'n': len(study_control_ids), 'excluded_since_previous': np.nan},
+                {'study': study_name, 'step': 'active_arm_cohort', 'n': len(study_active_ids), 'excluded_since_previous': np.nan},
+                {'study': study_name, 'step': 'weight_available_treatment_subset', 'n': len(study_weight_ids), 'excluded_since_previous': len(study_treatment_ids - study_weight_ids)},
+                {'study': study_name, 'step': 'has_weight_and_insulin_data', 'n': len(study_insulin_ids), 'excluded_since_previous': len(study_weight_ids - study_insulin_ids)}
+            ])
+        by_study_path = csv_output_path.with_name(f'{csv_output_path.stem}_by_study{csv_output_path.suffix}')
+        pd.DataFrame(by_study_rows).to_csv(by_study_path, index=False)
+
+        boxes = [
+            {'key': 'original', 'x': 0.50, 'y': 0.92, 'text': f"CLOUD/CLVR source\nparticipants\nn={len(original_ids)}"},
+            {'key': 'cgm', 'x': 0.50, 'y': 0.78, 'text': f"Cleaned CGM available\nn={len(cgm_ids)}\nExcluded: {len(original_ids - cgm_ids)}"},
+            {'key': 'cpep', 'x': 0.50, 'y': 0.64, 'text': f"C-peptide available\nn={len(cpep_ids)}\nExcluded: {len(cgm_ids - cpep_ids)}"},
+            {'key': 'treatment', 'x': 0.50, 'y': 0.50, 'text': f"Treatment arm available\nn={len(treatment_ids)}\nExcluded: {len(cpep_ids - treatment_ids)}"},
+            {'key': 'cohort', 'x': 0.50, 'y': 0.36, 'text': f"Workstream 2\nanalysis cohort\nn={len(treatment_ids)}"},
+            {'key': 'control', 'x': 0.28, 'y': 0.18, 'text': f"Control / standard care\nn={len(control_ids)}"},
+            {'key': 'active', 'x': 0.72, 'y': 0.18, 'text': f"Active / AID arm\nn={len(active_ids)}"},
+            {'key': 'weight', 'x': 0.84, 'y': 0.50, 'text': f"Weight available\nsubset\nn={len(weight_ids)}\nExcluded: {len(treatment_ids - weight_ids)}", 'facecolor': '#f5f0df'},
+            {'key': 'insulin', 'x': 0.84, 'y': 0.36, 'text': f"Has weight +\ninsulin data\nn={len(insulin_ids)}\nExcluded: {len(weight_ids - insulin_ids)}", 'facecolor': '#f5f0df'}
+        ]
+        arrows = [
+            ('original', 'cgm'),
+            ('cgm', 'cpep'),
+            ('cpep', 'treatment'),
+            ('treatment', 'cohort'),
+            ('cohort', 'control'),
+            ('cohort', 'active'),
+            ('treatment', 'weight'),
+            ('weight', 'insulin')
+        ]
+        self._save_consort_flow_plot(
+            boxes,
+            arrows,
+            'Workstream 2 Participant Flow',
+            graph_output_path
+        )
+        return None
     
     def print_feature_availability_table(self) -> None:
         """
-        Plot feature availability per time bin across studies and save availability heatmaps.
+        Plot subject-level feature availability per time bin across studies.
+
+        The title shows total unique participants in the full `df_final`, and
+        time-bin denominators are shown in the column labels as `N=...`.
 
         Args:
             None
@@ -4718,18 +6605,32 @@ class DataAnalysis:
             None: Saves PNGs under './data/graphs/feature_analysis/availability/'.
         """
 
-        def _num_key(idx: pd.Index) -> pd.Series:
+        def _time_bin_order(idx: pd.Index) -> list[str]:
             """
-            Extract numeric parts from an index for natural sorting (e.g., 'Month 12').
+            Order time bins chronologically instead of alphabetically.
 
             Args:
-                idx: Pandas Index to parse.
+                idx: Pandas Index of time-bin labels.
 
             Returns:
-                pd.Series: Numeric series used as sort key.
+                list[str]: Labels ordered by study time.
             """
-            nums = idx.to_series().astype(str).str.extract(r'(\\d+)')[0]
-            return pd.to_numeric(nums, errors='coerce')
+            def key(value: str) -> tuple[float, str]:
+                value = str(value)
+                if value == 'Baseline':
+                    return (0.0, value)
+
+                match = re.search(r'Week\s+(\d+)', value)
+                if match:
+                    return (float(match.group(1)) / 4.0, value)
+
+                match = re.search(r'Month\s+(\d+)', value)
+                if match:
+                    return (float(match.group(1)), value)
+
+                return (float('inf'), value)
+
+            return sorted(idx, key=key)
         
         dict_dfs = self.datasets.copy()
 
@@ -4738,15 +6639,27 @@ class DataAnalysis:
             features = [c for c in df.columns if c not in exclude]
             dynamic_feature = "glucose mmol/l"
             static_features = [c for c in features if c != dynamic_feature]
+            total_unique_ids = df['id'].nunique().compute()
             n_ids_by_bin = df.groupby('time_bin')['id'].nunique().compute()  # Series
-            n = n_ids_by_bin['Baseline']
 
             stat_first = df.groupby(['time_bin','id'])[static_features].first().compute()
             static_missing_by_bin = stat_first.notna().groupby(level=0).sum().astype('int64').sort_index(axis=1)
-            static_missing_by_bin = static_missing_by_bin.sort_index(key = _num_key)
+            ordered_time_bins = _time_bin_order(static_missing_by_bin.index)
+            static_missing_by_bin = static_missing_by_bin.reindex(ordered_time_bins)
             static_missing_by_bin = static_missing_by_bin.T
-            static_missing_by_bin.insert(0, 'N', n)
-            self.plot_availability(static_missing_by_bin, f'./data/graphs/feature_analysis/availability/{df_name}.png')
+            n_ids_by_bin = n_ids_by_bin.reindex(ordered_time_bins)
+            static_missing_by_bin.rename(
+                columns={
+                    time_bin: f"{time_bin}\n(N={int(n_ids_by_bin.loc[time_bin])})"
+                    for time_bin in ordered_time_bins
+                },
+                inplace=True
+            )
+            self.plot_availability(
+                static_missing_by_bin,
+                f'./data/graphs/feature_analysis/availability/{df_name}.png',
+                title=f'{df_name} Completeness Table (Total unique N={int(total_unique_ids)})'
+            )
 
     def print_feature_histograms(self) -> None:
         """
@@ -4807,15 +6720,556 @@ class DataAnalysis:
             self.plot_feature_charts(mat, features, df_name)
         return None
 
-    def print_characteristics_table_baseline(self) -> pd.DataFrame:
-        available_studies = sorted([s for s in ALL_STUDIES if s in self.datasets])
-        if not available_studies:
-            return pd.DataFrame()
-        output_dir = Path('./data/csv_results/tables/characteristics_table')
+    def print_repeated_clinical_feature_time_bins(
+            self,
+            features: list[str] | None = None,
+            studies: list[str] | None = None,
+            save_csv: bool = True,
+            source_kind: str = 'original'
+        ) -> pd.DataFrame:
+        """
+        Print clinical feature values that appear in multiple time bins per subject.
+
+        Args:
+            features: Clinical feature columns to check. Uses common lab/insulin/body-size
+                features when None.
+            studies: Dataset names to check. Uses all loaded datasets when None.
+            save_csv: Whether to save the printed rows to csv.
+            source_kind: Feature CSV version to compare against: 'original' or 'clean'.
+                Defaults to 'original' to check whether aggregation created repeats.
+
+        Returns:
+            pd.DataFrame: Repeated final values with source-row counts and source locations.
+
+        Raises:
+            ValueError: If source_kind is invalid, no requested studies are loaded, or no
+                requested features are present.
+        """
+        if source_kind not in {'clean', 'original'}:
+            raise ValueError("source_kind must be either 'clean' or 'original'.")
+
+        default_features = [
+            'hb_a1c', 'hb_a1c_cap', 'hb_a1c_ven', 'hb_a1c_local',
+            'total_ins_dose', 'basal_ins_dose', 'bolus_ins_dose',
+            'weight', 'height',
+            'cpep_fast', 'cpep_pre10_min', 'cpep_0_min', 'cpep_15_min', 'cpep_30_min',
+            'cpep_60_min', 'cpep_90_min', 'cpep_120_min', 'cpep_auc',
+            'glucose_fast', 'glucose_pre10_min', 'glucose_0_min', 'glucose_15_min',
+            'glucose_30_min', 'glucose_60_min', 'glucose_90_min', 'glucose_120_min',
+        ]
+        features = default_features if features is None else list(features)
+        dict_dfs = self.datasets.copy()
+        if studies is not None:
+            missing_studies = sorted(set(studies) - set(dict_dfs))
+            if missing_studies:
+                raise ValueError(f"Requested studies are not loaded: {missing_studies}")
+            dict_dfs = {name: dict_dfs[name] for name in studies}
+        if not dict_dfs:
+            raise ValueError("No loaded studies available for repeated clinical feature check.")
+
+        rows = []
+        any_feature_present = False
+        for study_name, df in dict_dfs.items():
+            df = df.compute() if hasattr(df, 'compute') else df.copy()
+            required = {'id', 'time_bin'}
+            if not required.issubset(df.columns):
+                continue
+            df['id'] = df['id'].astype(str).str.strip()
+            df['source_match_id'] = df['id']
+            study_id_prefixes = {
+                'clvr': 'CLVR_',
+                'diagnode': 'Diagnode_',
+                'itx': 'iTx_',
+                'jaeb_healthy': 'JAEB_Healthy_',
+            }
+            if study_name in study_id_prefixes:
+                df['source_match_id'] = df['source_match_id'].str.replace(
+                    f"^{re.escape(study_id_prefixes[study_name])}",
+                    '',
+                    regex=True
+                )
+
+            study_features = [feature for feature in features if feature in df.columns]
+            if study_features:
+                any_feature_present = True
+
+            source_lookup = {}
+            source_feature_aliases = {
+                'hb_a1c': ['hb_a1c', 'hb_a1c_cap', 'hb_a1c_ven', 'hb_a1c_local'],
+                'glucose_fast': ['glucose_fast', 'glucose_0_min'],
+                'cpep_fast': ['cpep_fast', 'cpep_0_min'],
+            }
+            source_root = Path(f'./data/studies/{study_name}/csv_files')
+            source_paths = sorted(source_root.glob(f'*/df_{source_kind}.csv')) if source_root.exists() else []
+            source_marker_cols = [
+                'time_bin', 'visit', 'dy', 'event_date', 'visit_date', 'CollectionDt',
+                'Vitals Assessment Date', 'Date'
+            ]
+            for source_path in source_paths:
+                try:
+                    source_df = pd.read_csv(source_path)
+                except Exception as exc:
+                    raise ValueError(f"Could not read source feature file {source_path}: {exc}") from exc
+                if 'id' not in source_df.columns:
+                    continue
+                source_df['id'] = source_df['id'].astype(str).str.strip()
+                source_df['source_match_id'] = source_df['id']
+                if study_name in study_id_prefixes:
+                    source_df['source_match_id'] = source_df['source_match_id'].str.replace(
+                        f"^{re.escape(study_id_prefixes[study_name])}",
+                        '',
+                        regex=True
+                    )
+
+                for feature in study_features:
+                    candidate_cols = source_feature_aliases.get(feature, [feature])
+                    present_feature_cols = [col for col in candidate_cols if col in source_df.columns]
+                    for source_feature in present_feature_cols:
+                        source_sub = source_df[['source_match_id', source_feature] + [c for c in source_marker_cols if c in source_df.columns]].copy()
+                        source_sub = source_sub.dropna(subset=[source_feature])
+                        if source_sub.empty:
+                            continue
+
+                        source_numeric_values = pd.to_numeric(source_sub[source_feature], errors='coerce')
+                        if source_numeric_values.notna().any():
+                            source_sub = source_sub.loc[source_numeric_values.notna()].copy()
+                            source_sub['value'] = source_numeric_values.loc[source_sub.index].round(6).astype(str)
+                        else:
+                            source_sub['value'] = source_sub[source_feature].astype(str).str.strip()
+                            source_sub = source_sub[source_sub['value'] != '']
+
+                        source_sub['source_file'] = str(source_path)
+                        source_sub['source_feature'] = source_feature
+                        marker_cols_present = [c for c in source_marker_cols if c in source_sub.columns]
+                        if marker_cols_present:
+                            source_sub['source_location'] = source_sub[marker_cols_present].astype(str).agg(
+                                lambda s: '; '.join(
+                                    f'{col}={val}' for col, val in s.items()
+                                    if val and val.lower() not in {'nan', 'nat', 'none'}
+                                ),
+                                axis=1
+                            )
+                        else:
+                            source_sub['source_location'] = ''
+
+                        source_lookup.setdefault(feature, []).append(
+                            source_sub[['source_match_id', 'value', 'source_file', 'source_feature', 'source_location']]
+                        )
+
+            source_lookup = {
+                feature: pd.concat(source_parts, ignore_index=True).drop_duplicates()
+                for feature, source_parts in source_lookup.items()
+            }
+
+            for feature in study_features:
+                sub_cols = ['id', 'source_match_id', 'time_bin', feature]
+                if 'visit' in df.columns:
+                    sub_cols.append('visit')
+                if 'timestamp' in df.columns:
+                    sub_cols.append('timestamp')
+                sub = df[sub_cols].dropna(subset=[feature]).drop_duplicates().copy()
+                if sub.empty:
+                    continue
+
+                numeric_values = pd.to_numeric(sub[feature], errors='coerce')
+                if numeric_values.notna().any():
+                    sub = sub.loc[numeric_values.notna()].copy()
+                    sub['value'] = numeric_values.loc[sub.index].round(6).astype(str)
+                else:
+                    sub['value'] = sub[feature].astype(str).str.strip()
+                    sub = sub[sub['value'] != '']
+
+                repeated = (
+                    sub.groupby(['id', 'source_match_id', 'value'])['time_bin']
+                    .apply(lambda s: sorted(pd.unique(s.astype(str))))
+                    .reset_index(name='time_bins')
+                )
+                if 'visit' in sub.columns:
+                    final_visits = (
+                        sub.groupby(['id', 'source_match_id', 'value', 'time_bin'])['visit']
+                        .apply(lambda s: ', '.join(sorted(pd.unique(s.dropna().astype(str)))))
+                        .reset_index(name='visits')
+                    )
+                    final_visits = (
+                        final_visits.groupby(['id', 'source_match_id', 'value'])
+                        .apply(
+                            lambda g: ' | '.join(
+                                f"{row['time_bin']}: {row['visits'] or 'NA'}"
+                                for _, row in g.sort_values('time_bin').iterrows()
+                            ),
+                            include_groups=False
+                        )
+                        .reset_index(name='final_visits')
+                    )
+                    repeated = repeated.merge(final_visits, on=['id', 'source_match_id', 'value'], how='left')
+                else:
+                    repeated['final_visits'] = ''
+                if 'timestamp' in sub.columns:
+                    sub['timestamp'] = pd.to_datetime(sub['timestamp'], errors='coerce')
+                    final_first_cgm_dates = (
+                        sub.groupby(['id', 'source_match_id', 'value', 'time_bin'])['timestamp']
+                        .min()
+                        .reset_index(name='first_cgm_date')
+                    )
+                    final_first_cgm_dates['first_cgm_date'] = final_first_cgm_dates['first_cgm_date'].dt.date.astype(str)
+                    final_first_cgm_dates = (
+                        final_first_cgm_dates.groupby(['id', 'source_match_id', 'value'])
+                        .apply(
+                            lambda g: ' | '.join(
+                                f"{row['time_bin']}: {row['first_cgm_date']}"
+                                for _, row in g.sort_values('time_bin').iterrows()
+                                if row['first_cgm_date'] != 'NaT'
+                            ),
+                            include_groups=False
+                        )
+                        .reset_index(name='final_first_cgm_dates')
+                    )
+                    repeated = repeated.merge(final_first_cgm_dates, on=['id', 'source_match_id', 'value'], how='left')
+                    repeated['final_first_cgm_dates'] = repeated['final_first_cgm_dates'].fillna('')
+                else:
+                    repeated['final_first_cgm_dates'] = ''
+                repeated['n_time_bins'] = repeated['time_bins'].apply(len)
+                repeated = repeated[repeated['n_time_bins'] > 1].copy()
+                if repeated.empty:
+                    continue
+
+                repeated.insert(0, 'feature', feature)
+                repeated.insert(0, 'study', study_name)
+                repeated['time_bins'] = repeated['time_bins'].apply(lambda bins: ', '.join(bins))
+                source_pool = source_lookup.get(feature)
+                if source_pool is None or source_pool.empty:
+                    repeated['source_n_rows'] = 0
+                    repeated['source_files'] = ''
+                    repeated['source_features'] = ''
+                    repeated['source_locations'] = ''
+                    repeated['source_status'] = 'source_feature_not_found'
+                else:
+                    source_matches = (
+                        source_pool.groupby(['source_match_id', 'value'])
+                        .agg(
+                            source_n_rows=('source_file', 'size'),
+                            source_files=('source_file', lambda s: ' | '.join(sorted(pd.unique(s)))),
+                            source_features=('source_feature', lambda s: ', '.join(sorted(pd.unique(s)))),
+                            source_locations=('source_location', lambda s: ' | '.join(
+                                loc for loc in pd.unique(s) if str(loc).strip()
+                            ))
+                        )
+                        .reset_index()
+                    )
+                    repeated = repeated.merge(source_matches, on=['source_match_id', 'value'], how='left')
+                    repeated['source_n_rows'] = repeated['source_n_rows'].fillna(0).astype(int)
+                    repeated[['source_files', 'source_features', 'source_locations']] = (
+                        repeated[['source_files', 'source_features', 'source_locations']].fillna('')
+                    )
+                    repeated['source_status'] = np.select(
+                        [
+                            repeated['source_n_rows'] == 0,
+                            repeated['source_n_rows'] == 1,
+                            repeated['source_n_rows'] >= repeated['n_time_bins'],
+                        ],
+                        [
+                            'no_matching_source_value',
+                            'single_source_row_reused',
+                            'source_value_repeated',
+                        ],
+                        default='fewer_source_rows_than_final_bins'
+                    )
+
+                rows.append(repeated[[
+                    'study', 'feature', 'id', 'value', 'time_bins', 'final_visits',
+                    'final_first_cgm_dates', 'n_time_bins',
+                    'source_n_rows', 'source_files', 'source_features',
+                    'source_locations', 'source_status'
+                ]])
+
+        if not any_feature_present:
+            raise ValueError(f"None of the requested features are present in loaded datasets: {features}")
+
+        if rows:
+            result = pd.concat(rows, ignore_index=True)
+            result.sort_values(by=['study', 'feature', 'id', 'value'], inplace=True)
+        else:
+            result = pd.DataFrame(columns=[
+                'study', 'feature', 'id', 'value', 'time_bins', 'n_time_bins',
+                'final_visits', 'final_first_cgm_dates', 'source_n_rows', 'source_files', 'source_features',
+                'source_locations', 'source_status'
+            ])
+
+        if result.empty:
+            print("No repeated clinical feature values across multiple time bins were found.")
+
+        if save_csv:
+            output_dir = Path('./data/csv_results/feature_time_bin_repeats')
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f'repeated_clinical_feature_time_bins_with_df_{source_kind}.csv'
+            detail_path = output_dir / f'repeated_clinical_feature_time_bins_with_df_{source_kind}_details.csv'
+            summary_path = output_dir / f'repeated_clinical_feature_time_bins_with_df_{source_kind}_summary.csv'
+
+            if result.empty:
+                friendly = result.copy()
+                summary = pd.DataFrame(columns=['study', 'feature', 'review', 'n_rows', 'n_subjects'])
+            else:
+                review_map = {
+                    'single_source_row_reused': 'REVIEW: one source row appears in multiple final time bins',
+                    'fewer_source_rows_than_final_bins': 'REVIEW: fewer source rows than final time bins',
+                    'no_matching_source_value': 'CHECK: final value not found in source CSV',
+                    'source_feature_not_found': 'CHECK: source feature/CSV not found',
+                    'source_value_repeated': 'LIKELY OK: value is repeated in source CSV',
+                }
+                review_rank = {
+                    'REVIEW: one source row appears in multiple final time bins': 0,
+                    'REVIEW: fewer source rows than final time bins': 1,
+                    'CHECK: final value not found in source CSV': 2,
+                    'CHECK: source feature/CSV not found': 3,
+                    'LIKELY OK: value is repeated in source CSV': 4,
+                }
+                friendly = result.copy()
+                friendly['review'] = friendly['source_status'].map(review_map).fillna(friendly['source_status'])
+                friendly['sort_rank'] = friendly['review'].map(review_rank).fillna(99)
+                friendly['source_files'] = friendly['source_files'].apply(
+                    lambda value: ' | '.join(
+                        Path(path).parent.name for path in str(value).split(' | ') if path
+                    )
+                )
+                friendly.rename(
+                    columns={
+                        'id': 'subject_id',
+                        'time_bins': 'final_time_bins',
+                        'final_visits': 'final_time_bin_visits',
+                        'final_first_cgm_dates': 'final_first_cgm_dates',
+                        'n_time_bins': 'n_final_time_bins',
+                        'source_n_rows': 'matching_source_rows',
+                        'source_files': 'source_feature_files',
+                    },
+                    inplace=True
+                )
+                friendly = friendly.sort_values(
+                    by=['study', 'subject_id', 'sort_rank', 'feature', 'value'],
+                    kind='mergesort'
+                )
+                friendly = friendly[[
+                    'review', 'study', 'feature', 'subject_id', 'value',
+                    'final_time_bins', 'final_time_bin_visits', 'final_first_cgm_dates',
+                    'n_final_time_bins', 'matching_source_rows', 'source_feature_files',
+                    'source_locations'
+                ]]
+
+                summary = (
+                    friendly.groupby(['study', 'feature', 'review'], as_index=False)
+                    .agg(
+                        n_rows=('subject_id', 'size'),
+                        n_subjects=('subject_id', 'nunique')
+                    )
+                    .sort_values(by=['study', 'feature', 'review'], kind='mergesort')
+                )
+
+            friendly.to_csv(output_path, index=False)
+            result.to_csv(detail_path, index=False)
+            summary.to_csv(summary_path, index=False)
+            print(
+                f"Saved {len(result)} repeated clinical feature rows to {output_path} "
+                f"(details: {detail_path}; summary: {summary_path})"
+            )
+
+        return result
+
+    def _load_cdc_bmi_for_age_lms(self) -> pd.DataFrame:
+        """
+        Load the CDC 2000 BMI-for-age LMS reference table used for pediatric BMI percentiles.
+
+        Returns:
+            CDC LMS table with numeric sex, age-month, L, M, and S columns.
+
+        Raises:
+            FileNotFoundError: If the local CDC reference CSV is missing.
+            ValueError: If required LMS columns are missing or cannot be parsed.
+        """
+        lms_path = Path('./data/reference/cdc_bmi_for_age_lms.csv')
+        if not lms_path.exists():
+            raise FileNotFoundError(
+                "BMI percentile calculation requires the CDC BMI-for-age LMS file at "
+                f"{lms_path}. Download the CDC bmiagerev.csv reference table before "
+                "building the baseline characteristics table."
+            )
+
+        lms = pd.read_csv(lms_path)
+        required_cols = {'Sex', 'Agemos', 'L', 'M', 'S'}
+        missing_cols = sorted(required_cols - set(lms.columns))
+        if missing_cols:
+            raise ValueError(
+                f"CDC BMI-for-age LMS file is missing required columns: {missing_cols}"
+            )
+
+        for col in required_cols:
+            lms[col] = pd.to_numeric(lms[col], errors='coerce')
+        lms = lms.dropna(subset=list(required_cols)).sort_values(['Sex', 'Agemos'])
+        if lms.empty:
+            raise ValueError("CDC BMI-for-age LMS file has no valid LMS rows.")
+
+        return lms
+
+    def _calculate_bmi(
+        self,
+        df: pd.DataFrame,
+        height_col: str = 'height',
+        weight_col: str = 'weight_num'
+    ) -> pd.Series:
+        """
+        Calculate BMI in kg/m^2 from height and weight columns.
+
+        Heights greater than 3 are treated as centimeters; smaller positive
+        heights are treated as meters.
+        """
+        required_cols = {height_col, weight_col}
+        if not required_cols.issubset(df.columns):
+            return pd.Series(np.nan, index=df.index, dtype='float64')
+
+        height = pd.to_numeric(df[height_col], errors='coerce')
+        height_m = height.where(height <= 3, height / 100)
+        weight = pd.to_numeric(df[weight_col], errors='coerce')
+        bmi = weight / (height_m ** 2)
+        return bmi.where(height_m.gt(0) & weight.gt(0))
+
+    def _calculate_bmi_z_score(
+        self,
+        df: pd.DataFrame,
+        age_col: str = 'age_num',
+        sex_col: str = 'sex_norm',
+        height_col: str = 'height',
+        weight_col: str = 'weight_num'
+    ) -> pd.Series:
+        """
+        Calculate CDC BMI-for-age Z-score for rows with complete inputs.
+
+        BMI Z-score is only defined for rows with age 2 to <20 years, male/female
+        sex, positive height, and positive weight. Other rows remain missing.
+        """
+        required_cols = {age_col, sex_col, height_col, weight_col}
+        if not required_cols.issubset(df.columns):
+            return pd.Series(np.nan, index=df.index, dtype='float64')
+
+        out = pd.Series(np.nan, index=df.index, dtype='float64')
+
+        age_years = pd.to_numeric(df[age_col], errors='coerce')
+        age_months = age_years * 12
+        bmi = self._calculate_bmi(df, height_col=height_col, weight_col=weight_col)
+        sex_code = df[sex_col].map({'male': 1, 'female': 2})
+
+        valid = (
+            age_years.between(2, 20, inclusive='left')
+            & sex_code.notna()
+            & bmi.notna()
+        )
+        if not valid.any():
+            return out
+
+        lms = self._load_cdc_bmi_for_age_lms()
+        for sex, sex_lms in lms.groupby('Sex'):
+            sex_mask = valid & (sex_code == sex)
+            if not sex_mask.any():
+                continue
+
+            age_values = sex_lms['Agemos'].to_numpy()
+            min_age = float(np.nanmin(age_values))
+            max_age = float(np.nanmax(age_values))
+            in_range = sex_mask & age_months.between(min_age, max_age)
+            if not in_range.any():
+                continue
+
+            ages = age_months.loc[in_range].to_numpy()
+            l_vals = np.interp(ages, age_values, sex_lms['L'].to_numpy())
+            m_vals = np.interp(ages, age_values, sex_lms['M'].to_numpy())
+            s_vals = np.interp(ages, age_values, sex_lms['S'].to_numpy())
+            bmi_vals = bmi.loc[in_range].to_numpy()
+            z_vals = np.where(
+                l_vals == 0,
+                np.log(bmi_vals / m_vals) / s_vals,
+                (((bmi_vals / m_vals) ** l_vals) - 1) / (l_vals * s_vals)
+            )
+            out.loc[in_range] = z_vals
+
+        return out
+
+    def _calculate_bmi_percentile(
+        self,
+        df: pd.DataFrame,
+        age_col: str = 'age_num',
+        sex_col: str = 'sex_norm',
+        height_col: str = 'height',
+        weight_col: str = 'weight_num'
+    ) -> pd.Series:
+        """
+        Calculate CDC BMI-for-age percentile for rows with complete inputs.
+
+        BMI percentile is only defined for rows with age 2 to <20 years, male/female
+        sex, positive height, and positive weight. Other rows remain missing.
+        """
+        bmi_z_score = self._calculate_bmi_z_score(
+            df,
+            age_col=age_col,
+            sex_col=sex_col,
+            height_col=height_col,
+            weight_col=weight_col
+        )
+        return pd.Series(norm.cdf(bmi_z_score) * 100, index=df.index, dtype='float64')
+
+    def print_characteristics_table_baseline(
+        self,
+        df: pd.DataFrame | dd.DataFrame,
+        output_name: str = 'baseline_table.csv',
+        reference_datasets: list[tuple[str, pd.DataFrame | dd.DataFrame]] | None = None,
+        output_dir: str | Path = './data/csv_results/tables/characteristics_table',
+        p_value_group_names: tuple[str, str] | None = None,
+        split_group_columns: str = 'care_category'
+    ) -> pd.DataFrame:
+        """
+        Build a baseline characteristics table from an explicit cohort dataframe.
+
+        Continuous rows are reported as mean with standard deviation. BMI is
+        calculated from baseline height and weight, and BMI-for-age percentile and
+        Z-score are calculated for participants age 2 to <20 using the CDC 2000
+        BMI-for-age LMS reference table. If
+        `p_value_group_names` is supplied, the table appends statistical-test and
+        p-value columns comparing those two named table groups.
+
+        Args:
+            df: Main cohort dataframe. A `study` column is required for per-study columns.
+            output_name: CSV filename written under the characteristics table folder.
+            reference_datasets: Optional `(name, dataframe)` pairs appended after cohort columns.
+            output_dir: Folder where the CSV output is saved.
+            p_value_group_names: Optional pair of table group names to compare.
+                Continuous rows use Mann-Whitney U / Wilcoxon rank-sum tests, and
+                categorical rows use Fisher exact tests.
+            split_group_columns: Which two cohort summary columns to place after
+                All studies. Use `care_category` for standard/intensive insulin
+                delivery columns, or `treatment_arm` for actual trial
+                control/active columns.
+
+        Returns:
+            Baseline characteristics table.
+
+        Raises:
+            FileNotFoundError: If BMI percentile can be calculated but the CDC LMS
+                reference file is missing.
+            ValueError: If the main cohort is empty, lacks required identifiers,
+                the requested p-value groups are unavailable, or the CDC LMS file is malformed.
+        """
+        output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        if split_group_columns not in {'care_category', 'treatment_arm'}:
+            raise ValueError("`split_group_columns` must be either 'care_category' or 'treatment_arm'.")
 
         def _to_pandas(df_like: pd.DataFrame) -> pd.DataFrame:
             return df_like.compute() if hasattr(df_like, 'compute') else df_like.copy()
+
+        df = _to_pandas(df)
+        if df.empty:
+            raise ValueError("Baseline characteristics table requires a non-empty cohort dataframe.")
+        if 'id' not in df.columns:
+            raise ValueError("Baseline characteristics table requires an 'id' column.")
+        if 'study' not in df.columns:
+            raise ValueError("Baseline characteristics table requires a 'study' column for per-study columns.")
+        reference_datasets = [] if reference_datasets is None else reference_datasets
 
         def _norm_treatment(val) -> str:
             if pd.isna(val):
@@ -4837,32 +7291,42 @@ class DataAnalysis:
                 return 'female'
             return np.nan
 
-        def _fmt_count(series: pd.Series, mask: pd.Series) -> str:
-            denom = int(series.notna().sum())
+        def _fmt_count(series: pd.Series, mask: pd.Series, denom: int | None = None) -> str:
+            denom = int(series.notna().sum()) if denom is None else int(denom)
             num = int(mask.sum())
             if denom == 0:
                 return '0 (0.0%)'
             return f'{num} ({(num / denom) * 100:.1f}%)'
 
-        def _fmt_mean_p5_p95(values: pd.Series) -> str:
+        def _fmt_mean_sd(values: pd.Series) -> str:
             vals = pd.to_numeric(values, errors='coerce').dropna()
             if vals.empty:
                 return 'NA'
             mean = vals.mean()
-            p5 = vals.quantile(0.05)
-            p95 = vals.quantile(0.95)
-            return f'{mean:.2f} ({p5:.2f}, {p95:.2f})'
+            sd = vals.std(ddof=1) if len(vals) > 1 else np.nan
+            return f'{mean:.2f} ({sd:.2f})' if pd.notna(sd) else f'{mean:.2f} (NA)'
 
-        def _get_days_from_diagnosis(base: pd.DataFrame) -> pd.Series:
+        def _fmt_p_value(p_value: float) -> str:
+            if pd.isna(p_value):
+                return '..'
+            return 'p<0.001' if p_value < 0.001 else f'p={p_value:.3f}'
+
+        def _get_days_from_diagnosis(
+            base: pd.DataFrame,
+            first_timestamp_by_id: pd.Series | None = None
+        ) -> pd.Series:
+            if 'timestamp' in base.columns and 'diagnose_date' in base.columns:
+                if first_timestamp_by_id is not None and 'id' in base.columns:
+                    timestamp = base['id'].map(first_timestamp_by_id)
+                else:
+                    timestamp = pd.to_datetime(base['timestamp'], errors='coerce')
+                diagnose_date = pd.to_datetime(base['diagnose_date'], errors='coerce')
+                return (timestamp - diagnose_date).dt.days
+
             if 'dy' in base.columns:
                 dy_vals = pd.to_numeric(base['dy'], errors='coerce')
                 if dy_vals.notna().any():
                     return dy_vals
-
-            if 'timestamp' in base.columns and 'diagnose_date' in base.columns:
-                timestamp = pd.to_datetime(base['timestamp'], errors='coerce')
-                diagnose_date = pd.to_datetime(base['diagnose_date'], errors='coerce')
-                return (timestamp - diagnose_date).dt.days
 
             return pd.Series(np.nan, index=base.index, dtype='float64')
 
@@ -4888,6 +7352,9 @@ class DataAnalysis:
         def _build_baseline_df(df: pd.DataFrame, study_name: str) -> pd.DataFrame:
             if 'id' not in df.columns:
                 return pd.DataFrame()
+            first_timestamp_by_id = None
+            if 'timestamp' in df.columns:
+                first_timestamp_by_id = pd.to_datetime(df['timestamp'], errors='coerce').groupby(df['id']).min()
             base = _first_baseline_per_id(df)
             if base.empty:
                 return base
@@ -4908,27 +7375,34 @@ class DataAnalysis:
             else:
                 insulin_norm = pd.Series('', index=base.index, dtype='object')
             treatment_norm = base['treatment_norm'].copy()
+
             care = pd.Series(np.nan, index=base.index, dtype='object')
-            study_key = str(study_name).strip().lower()
-            if study_key == 'cloud':
-                care.loc[insulin_norm == 'mdi'] = 'standard care'
-                care.loc[insulin_norm == 'hybrid closed-loop'] = 'intensive care'
-                care.loc[insulin_norm == 'hybrid'] = 'intensive care'
-            elif study_key == 'clvr':
-                care.loc[insulin_norm == 'non-hcl'] = 'standard care'
-                care.loc[insulin_norm == 'hcl'] = 'intensive care'
-            elif study_key == 'diagnode':
-                care.loc[insulin_norm == 'no insulin pump'] = 'standard care'
-                care.loc[insulin_norm == 'insulin pump'] = 'intensive care'
-            elif study_key == 'jaeb_t1d':
-                care.loc[treatment_norm == 'control'] = 'standard care'
-                care.loc[treatment_norm == 'active'] = 'intensive care'
+            study_series = base['study'].astype(str).str.strip().str.lower()
+
+            care.loc[(study_series == 'bandit') & (insulin_norm == 'non-csii')] = 'standard care'
+            care.loc[(study_series == 'bandit') & (insulin_norm == 'csii')] = 'intensive care'
+
+            care.loc[(study_series == 'cloud') & (insulin_norm == 'mdi')] = 'standard care'
+            care.loc[(study_series == 'cloud') & (insulin_norm.isin(['hybrid closed-loop', 'hybrid']))] = 'intensive care'
+
+            care.loc[(study_series == 'clvr') & (insulin_norm == 'non-hcl')] = 'standard care'
+            care.loc[(study_series == 'clvr') & (insulin_norm == 'hcl')] = 'intensive care'
+
+            care.loc[(study_series == 'diagnode') & (insulin_norm == 'no insulin pump')] = 'standard care'
+            care.loc[(study_series == 'diagnode') & (insulin_norm == 'insulin pump')] = 'intensive care'
+
+            care.loc[(study_series == 'jaeb_t1d') & (treatment_norm == 'control')] = 'standard care'
+            care.loc[(study_series == 'jaeb_t1d') & (treatment_norm == 'active')] = 'intensive care'
+
             base['care_category'] = care
 
             base['sex_norm'] = base['sex'].apply(_norm_sex) if 'sex' in base.columns else np.nan
             base['age_num'] = pd.to_numeric(base['age'], errors='coerce') if 'age' in base.columns else np.nan
             base['weight_num'] = pd.to_numeric(base['weight'], errors='coerce') if 'weight' in base.columns else np.nan
-            base['days_from_diagnosis_num'] = _get_days_from_diagnosis(base)
+            base['bmi_num'] = self._calculate_bmi(base)
+            base['bmi_z_score'] = self._calculate_bmi_z_score(base)
+            base['bmi_percentile'] = self._calculate_bmi_percentile(base)
+            base['days_from_diagnosis_num'] = _get_days_from_diagnosis(base, first_timestamp_by_id)
 
             cpep_candidates = ['cpep_auc', 'cpep_fast', 'cpep_0_min']
             cpep_col = next((c for c in cpep_candidates if c in base.columns), None)
@@ -4967,42 +7441,124 @@ class DataAnalysis:
 
             return base
 
-        per_study = {}
-        for study in available_studies:
-            per_study[study] = _build_baseline_df(_to_pandas(self.datasets[study]), study)
+        cohort_studies = sorted(df['study'].dropna().astype(str).unique().tolist())
+        if not cohort_studies:
+            raise ValueError("Baseline characteristics table requires at least one non-missing study label.")
 
-        all_studies_df = pd.concat(per_study.values(), ignore_index=True) if per_study else pd.DataFrame()
-        table_sources = {'All studies': all_studies_df}
-        for study in available_studies:
+        per_study = {}
+        for study in cohort_studies:
+            study_df = df[df['study'].astype(str) == study].copy()
+            per_study[study] = _build_baseline_df(study_df, study)
+
+        reference_names = []
+        for reference_name, reference_df in reference_datasets:
+            if reference_name in per_study:
+                raise ValueError(f"Reference dataset name duplicates cohort study name: {reference_name}")
+            reference_names.append(reference_name)
+            per_study[reference_name] = _build_baseline_df(_to_pandas(reference_df), reference_name)
+
+        all_studies_df = _build_baseline_df(df, 'All studies')
+        if split_group_columns == 'care_category':
+            split_group_1_label = 'Standard Care'
+            split_group_2_label = 'Intensive Care'
+            split_group_1_df = all_studies_df[all_studies_df['care_category'] == 'standard care'].copy()
+            split_group_2_df = all_studies_df[all_studies_df['care_category'] == 'intensive care'].copy()
+        else:
+            split_group_1_label = 'Control'
+            split_group_2_label = 'Active'
+            split_group_1_df = all_studies_df[all_studies_df['treatment_norm'].isin(TREATMENT_GROUP_1)].copy()
+            split_group_2_df = all_studies_df[all_studies_df['treatment_norm'].isin(TREATMENT_GROUP_2)].copy()
+
+        table_sources = {
+            'All studies': all_studies_df,
+            split_group_1_label: split_group_1_df,
+            split_group_2_label: split_group_2_df
+        }
+        for study in cohort_studies + reference_names:
             table_sources[study] = per_study[study]
 
         def _col_label(name: str, df: pd.DataFrame) -> str:
             n = int(df['id'].nunique()) if (not df.empty and 'id' in df.columns) else 0
             return f'{name} (n={n})'
 
+        age_summary_label = (
+            'Age midpoint: mean (SD)'
+            if any('age_range' in per_study[study].columns for study in cohort_studies + reference_names)
+            else 'Age: mean (SD)'
+        )
+
         row_order = [
             'Control',
             'Active',
             'Insulin Delivery: Standard Care',
             'Insulin Delivery: Intensive Care',
-            'Days from Diagnosis: mean (5-95 percentile)',
-            'Age: mean (5-95 percentile)',
+            'Days from Diagnosis to CGM: mean (SD)',
+            age_summary_label,
             'Age (<18)',
             'Age (>=18)',
             'Sex (Male)',
             'Sex (Female)',
-            'Cpeptide: mean (5-95 percentile)',
-            'HbA1c: mean (5-95 percentile)',
-            'GMI: mean (5-95 percentile)',
-            'TIR: mean (5-95 percentile)',
-            'TITR: mean (5-95 percentile)',
-            'TBR Level 1: mean (5-95 percentile)',
-            'TBR Level 2: mean (5-95 percentile)',
-            'TAR Level 1: mean (5-95 percentile)',
-            'TAR Level 2: mean (5-95 percentile)',
-            'Weight for Adults: mean (5-95 percentile)',
-            'Weight for Children: mean (5-95 percentile)',
+            'Cpeptide: mean (SD)',
+            'HbA1c: mean (SD)',
+            'GMI: mean (SD)',
+            'TIR: mean (SD)',
+            'TITR: mean (SD)',
+            'TBR Level 1: mean (SD)',
+            'TBR Level 2: mean (SD)',
+            'TAR Level 1: mean (SD)',
+            'TAR Level 2: mean (SD)',
+            'BMI and weight',
+            'BMI for Children: mean (SD)',
+            'BMI percentile for Children: mean (SD)',
+            'BMI Z-score for Children: mean (SD)',
+            'BMI for Adults: mean (SD)',
+            'BMI percentile for Adults: mean (SD)',
+            'BMI Z-score for Adults: mean (SD)',
+            'Weight for Children: mean (SD)',
+            'Weight for Adults: mean (SD)',
         ]
+
+        continuous_test_specs = {
+            'Days from Diagnosis to CGM: mean (SD)': lambda x: x['days_from_diagnosis_num'],
+            age_summary_label: lambda x: x['age_num'],
+            'Cpeptide: mean (SD)': lambda x: x['cpep_value'],
+            'HbA1c: mean (SD)': lambda x: x['hb_a1c'],
+            'GMI: mean (SD)': lambda x: x['gmi'],
+            'TIR: mean (SD)': lambda x: x['TIR'],
+            'TITR: mean (SD)': lambda x: x['TITR'],
+            'TBR Level 1: mean (SD)': lambda x: x['TBR_Lvl_1'],
+            'TBR Level 2: mean (SD)': lambda x: x['TBR_Lvl_2'],
+            'TAR Level 1: mean (SD)': lambda x: x['TAR_Lvl_1'],
+            'TAR Level 2: mean (SD)': lambda x: x['TAR_Lvl_2'],
+            'BMI for Children: mean (SD)': lambda x: x.loc[x['age_num'] < 18, 'bmi_num'],
+            'BMI percentile for Children: mean (SD)': lambda x: x.loc[x['age_num'] < 18, 'bmi_percentile'],
+            'BMI Z-score for Children: mean (SD)': lambda x: x.loc[x['age_num'] < 18, 'bmi_z_score'],
+            'BMI for Adults: mean (SD)': lambda x: x.loc[x['age_num'] >= 18, 'bmi_num'],
+            'BMI percentile for Adults: mean (SD)': lambda x: x.loc[x['age_num'] >= 18, 'bmi_percentile'],
+            'BMI Z-score for Adults: mean (SD)': lambda x: x.loc[x['age_num'] >= 18, 'bmi_z_score'],
+            'Weight for Adults: mean (SD)': lambda x: x.loc[x['age_num'] >= 18, 'weight_num'],
+            'Weight for Children: mean (SD)': lambda x: x.loc[x['age_num'] < 18, 'weight_num'],
+        }
+        categorical_test_specs = {
+            'Control': lambda x: x['treatment_norm'].isin(TREATMENT_GROUP_1),
+            'Active': lambda x: x['treatment_norm'].isin(TREATMENT_GROUP_2),
+            'Insulin Delivery: Standard Care': lambda x: x['care_category'] == 'standard care',
+            'Insulin Delivery: Intensive Care': lambda x: x['care_category'] == 'intensive care',
+            'Age (<18)': lambda x: x['age_num'] < 18,
+            'Age (>=18)': lambda x: x['age_num'] >= 18,
+            'Sex (Male)': lambda x: x['sex_norm'] == 'male',
+            'Sex (Female)': lambda x: x['sex_norm'] == 'female',
+        }
+        categorical_valid_specs = {
+            'Control': lambda x: x['treatment_norm'] != '',
+            'Active': lambda x: x['treatment_norm'] != '',
+            'Insulin Delivery: Standard Care': lambda x: x['care_category'].notna(),
+            'Insulin Delivery: Intensive Care': lambda x: x['care_category'].notna(),
+            'Age (<18)': lambda x: x['age_num'].notna(),
+            'Age (>=18)': lambda x: x['age_num'].notna(),
+            'Sex (Male)': lambda x: x['sex_norm'].notna(),
+            'Sex (Female)': lambda x: x['sex_norm'].notna(),
+        }
 
         out = pd.DataFrame(index=row_order)
         for col_name, df in table_sources.items():
@@ -5016,6 +7572,7 @@ class DataAnalysis:
             age = df['age_num']
             days_from_diagnosis = df['days_from_diagnosis_num'] if 'days_from_diagnosis_num' in df.columns else pd.Series(np.nan, index=df.index)
             sex = df['sex_norm']
+            participant_n = int(df['id'].nunique()) if 'id' in df.columns else len(df)
 
             # Control/Active must come from treatment_arm mapping.
             control_mask = treatment.isin(TREATMENT_GROUP_1)
@@ -5027,34 +7584,113 @@ class DataAnalysis:
             ge18_mask = age >= 18
             male_mask = sex == 'male'
             female_mask = sex == 'female'
+            adults_bmi = df.loc[ge18_mask, 'bmi_num']
+            children_bmi = df.loc[lt18_mask, 'bmi_num']
+            children_bmi_percentile = df.loc[lt18_mask, 'bmi_percentile']
+            children_bmi_z_score = df.loc[lt18_mask, 'bmi_z_score']
+            adults_bmi_percentile = df.loc[ge18_mask, 'bmi_percentile']
+            adults_bmi_z_score = df.loc[ge18_mask, 'bmi_z_score']
             adults_weight = df.loc[ge18_mask, 'weight_num']
             children_weight = df.loc[lt18_mask, 'weight_num']
 
-            out.loc['Control', col_label] = _fmt_count(treatment, control_mask)
-            out.loc['Active', col_label] = _fmt_count(treatment, active_mask)
-            out.loc['Insulin Delivery: Standard Care', col_label] = _fmt_count(care_category, std_care_mask)
-            out.loc['Insulin Delivery: Intensive Care', col_label] = _fmt_count(care_category, int_care_mask)
-            out.loc['Days from Diagnosis: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(days_from_diagnosis)
-            out.loc['Age: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(age)
-            out.loc['Age (<18)', col_label] = _fmt_count(age, lt18_mask)
-            out.loc['Age (>=18)', col_label] = _fmt_count(age, ge18_mask)
-            out.loc['Sex (Male)', col_label] = _fmt_count(sex, male_mask)
-            out.loc['Sex (Female)', col_label] = _fmt_count(sex, female_mask)
-            out.loc['Cpeptide: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(df['cpep_value'])
-            out.loc['HbA1c: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(df['hb_a1c'])
-            out.loc['GMI: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(df['gmi'])
-            out.loc['TIR: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(df['TIR'])
-            out.loc['TITR: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(df['TITR'])
-            out.loc['TBR Level 1: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(df['TBR_Lvl_1'])
-            out.loc['TBR Level 2: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(df['TBR_Lvl_2'])
-            out.loc['TAR Level 1: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(df['TAR_Lvl_1'])
-            out.loc['TAR Level 2: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(df['TAR_Lvl_2'])
-            out.loc['Weight for Adults: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(adults_weight)
-            out.loc['Weight for Children: mean (5-95 percentile)', col_label] = _fmt_mean_p5_p95(children_weight)
+            out.loc['Control', col_label] = _fmt_count(treatment, control_mask, participant_n)
+            out.loc['Active', col_label] = _fmt_count(treatment, active_mask, participant_n)
+            out.loc['Insulin Delivery: Standard Care', col_label] = _fmt_count(care_category, std_care_mask, participant_n)
+            out.loc['Insulin Delivery: Intensive Care', col_label] = _fmt_count(care_category, int_care_mask, participant_n)
+            out.loc['Days from Diagnosis to CGM: mean (SD)', col_label] = _fmt_mean_sd(days_from_diagnosis)
+            out.loc[age_summary_label, col_label] = _fmt_mean_sd(age)
+            out.loc['Age (<18)', col_label] = _fmt_count(age, lt18_mask, participant_n)
+            out.loc['Age (>=18)', col_label] = _fmt_count(age, ge18_mask, participant_n)
+            out.loc['Sex (Male)', col_label] = _fmt_count(sex, male_mask, participant_n)
+            out.loc['Sex (Female)', col_label] = _fmt_count(sex, female_mask, participant_n)
+            out.loc['Cpeptide: mean (SD)', col_label] = _fmt_mean_sd(df['cpep_value'])
+            out.loc['HbA1c: mean (SD)', col_label] = _fmt_mean_sd(df['hb_a1c'])
+            out.loc['GMI: mean (SD)', col_label] = _fmt_mean_sd(df['gmi'])
+            out.loc['TIR: mean (SD)', col_label] = _fmt_mean_sd(df['TIR'])
+            out.loc['TITR: mean (SD)', col_label] = _fmt_mean_sd(df['TITR'])
+            out.loc['TBR Level 1: mean (SD)', col_label] = _fmt_mean_sd(df['TBR_Lvl_1'])
+            out.loc['TBR Level 2: mean (SD)', col_label] = _fmt_mean_sd(df['TBR_Lvl_2'])
+            out.loc['TAR Level 1: mean (SD)', col_label] = _fmt_mean_sd(df['TAR_Lvl_1'])
+            out.loc['TAR Level 2: mean (SD)', col_label] = _fmt_mean_sd(df['TAR_Lvl_2'])
+            out.loc['BMI and weight', col_label] = ''
+            out.loc['BMI for Children: mean (SD)', col_label] = _fmt_mean_sd(children_bmi)
+            out.loc['BMI percentile for Children: mean (SD)', col_label] = _fmt_mean_sd(children_bmi_percentile)
+            out.loc['BMI Z-score for Children: mean (SD)', col_label] = _fmt_mean_sd(children_bmi_z_score)
+            out.loc['BMI for Adults: mean (SD)', col_label] = _fmt_mean_sd(adults_bmi)
+            out.loc['BMI percentile for Adults: mean (SD)', col_label] = _fmt_mean_sd(adults_bmi_percentile)
+            out.loc['BMI Z-score for Adults: mean (SD)', col_label] = _fmt_mean_sd(adults_bmi_z_score)
+            out.loc['Weight for Children: mean (SD)', col_label] = _fmt_mean_sd(children_weight)
+            out.loc['Weight for Adults: mean (SD)', col_label] = _fmt_mean_sd(adults_weight)
 
-        ordered_cols = [_col_label('All studies', all_studies_df)] + [_col_label(study, per_study[study]) for study in available_studies]
+        ordered_cols = (
+            [_col_label('All studies', all_studies_df)]
+            + [_col_label(split_group_1_label, split_group_1_df)]
+            + [_col_label(split_group_2_label, split_group_2_df)]
+            + [_col_label(study, per_study[study]) for study in cohort_studies]
+            + [_col_label(study, per_study[study]) for study in reference_names]
+        )
         out = out.reindex(columns=ordered_cols)
-        out.to_csv(output_dir / 'baseline_table.csv')
+
+        if p_value_group_names is not None:
+            missing_groups = [name for name in p_value_group_names if name not in table_sources]
+            if missing_groups:
+                raise ValueError(
+                    "Baseline characteristics p-value groups must match table source names. "
+                    f"Missing groups: {missing_groups}"
+                )
+
+            group_1 = table_sources[p_value_group_names[0]]
+            group_2 = table_sources[p_value_group_names[1]]
+            out['Statistical test'] = '..'
+            out['p value'] = '..'
+
+            for row_name, value_getter in continuous_test_specs.items():
+                continuous_rows_with_p = {
+                    'Days from Diagnosis to CGM: mean (SD)',
+                    age_summary_label,
+                    'Cpeptide: mean (SD)',
+                    'HbA1c: mean (SD)',
+                    'BMI for Children: mean (SD)',
+                    'BMI percentile for Children: mean (SD)',
+                    'BMI Z-score for Children: mean (SD)',
+                    'BMI for Adults: mean (SD)',
+                    'BMI percentile for Adults: mean (SD)',
+                    'BMI Z-score for Adults: mean (SD)',
+                    'Weight for Adults: mean (SD)',
+                    'Weight for Children: mean (SD)',
+                }
+                if row_name not in continuous_rows_with_p:
+                    continue
+                values_1 = pd.to_numeric(value_getter(group_1), errors='coerce').dropna()
+                values_2 = pd.to_numeric(value_getter(group_2), errors='coerce').dropna()
+                if values_1.empty or values_2.empty:
+                    continue
+                _, p_value = mannwhitneyu(values_1, values_2, alternative='two-sided')
+                out.loc[row_name, 'Statistical test'] = 'Wilcoxon rank-sum'
+                out.loc[row_name, 'p value'] = _fmt_p_value(p_value)
+
+            categorical_rows_with_p = {
+                'Age (<18)',
+                'Sex (Male)',
+            }
+            for row_name, mask_getter in categorical_test_specs.items():
+                if row_name not in categorical_rows_with_p:
+                    continue
+                valid_1 = categorical_valid_specs[row_name](group_1).fillna(False)
+                valid_2 = categorical_valid_specs[row_name](group_2).fillna(False)
+                if valid_1.sum() == 0 or valid_2.sum() == 0:
+                    continue
+                mask_1 = mask_getter(group_1).fillna(False) & valid_1
+                mask_2 = mask_getter(group_2).fillna(False) & valid_2
+                table = [
+                    [int(mask_1.sum()), int((valid_1 & ~mask_1).sum())],
+                    [int(mask_2.sum()), int((valid_2 & ~mask_2).sum())],
+                ]
+                _, p_value = fisher_exact(table)
+                out.loc[row_name, 'Statistical test'] = 'Fisher exact'
+                out.loc[row_name, 'p value'] = _fmt_p_value(p_value)
+
+        out.to_csv(output_dir / output_name)
         return out
     
     def print_good_days(self) -> None:
@@ -5089,10 +7725,25 @@ class DataAnalysis:
 
         return None
  
-    def print_insulin_inventory(self) -> None:
+    def print_insulin_inventory(
+        self,
+        output_dir: str | Path = './data/csv_results/tables/insulin'
+    ) -> None:
+        """
+        Save insulin-dose availability tables by study and time bin.
+
+        In addition to the per-study tables, saves merged long and wide tables
+        across studies in the same output folder.
+
+        Args:
+            output_dir: Folder where per-study insulin inventory CSVs are saved.
+
+        Returns:
+            None
+        """
         dict_dfs = self.datasets.copy()
         all_dict = {k: v.compute() for k, v in dict_dfs.items() if k in ALL_STUDIES}
-        output_dir = Path('./data/csv_results/tables/insulin')
+        output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         all_ins_cols = sorted(
@@ -5100,6 +7751,19 @@ class DataAnalysis:
         )
         both_row_label = 'basal_and_bolus_ins_dose'
         summary_rows = all_ins_cols + [both_row_label]
+        merged_wide_tables = []
+        merged_long_tables = []
+
+        def _time_bin_sort_key(value):
+            value_str = str(value).strip().lower()
+            if value_str == 'baseline':
+                return (-1, 0.0)
+            match = re.search(r'(-?\d+(\.\d+)?)', str(value))
+            if match:
+                return (0, float(match.group(1)))
+            if 'screen' in value_str:
+                return (-2, 0.0)
+            return (1, float('inf'))
 
         print('Insulin Column Non-Null Coverage by Time Bin (% with subjects shown as n=with_value/total):')
         for df_name in sorted(all_dict.keys()):
@@ -5107,17 +7771,6 @@ class DataAnalysis:
             ins_cols = [col for col in df.columns if 'ins_dose' in col.lower()]
             basal_col = next((col for col in ins_cols if col.lower() == 'basal_ins_dose'), None)
             bolus_col = next((col for col in ins_cols if col.lower() == 'bolus_ins_dose'), None)
-
-            def _time_bin_sort_key(value):
-                value_str = str(value).strip().lower()
-                if value_str == 'baseline':
-                    return (-1, 0.0)
-                match = re.search(r'(-?\d+(\.\d+)?)', str(value))
-                if match:
-                    return (0, float(match.group(1)))
-                if 'screen' in value_str:
-                    return (-2, 0.0)
-                return (1, float('inf'))
 
             time_bins = sorted(df['time_bin'].dropna().unique(), key=_time_bin_sort_key)
             summary_table = pd.DataFrame(index=summary_rows, columns=time_bins, dtype='object')
@@ -5151,17 +7804,86 @@ class DataAnalysis:
             print(summary_table.to_string())
             summary_table.to_csv(output_dir / f'{df_name}_insulin_inventory.csv')
 
+            summary_table_for_merge = (
+                summary_table
+                .reset_index()
+                .rename(columns={'index': 'insulin_feature'})
+            )
+            summary_table_for_merge.insert(0, 'study', df_name)
+            merged_wide_tables.append(summary_table_for_merge)
+            merged_long_tables.append(
+                summary_table_for_merge.melt(
+                    id_vars=['study', 'insulin_feature'],
+                    var_name='time_bin',
+                    value_name='availability'
+                )
+            )
+
+        if not merged_wide_tables or not merged_long_tables:
+            raise ValueError("No insulin inventory tables were produced.")
+
+        merged_long = pd.concat(merged_long_tables, ignore_index=True)
+        merged_long.sort_values(
+            by=['study', 'insulin_feature', 'time_bin'],
+            key=lambda col: col.map(_time_bin_sort_key) if col.name == 'time_bin' else col,
+            inplace=True
+        )
+        merged_long.to_csv(output_dir / 'all_studies_insulin_inventory_long.csv', index=False)
+
+        merged_wide = pd.concat(merged_wide_tables, ignore_index=True)
+        time_bin_cols = sorted(
+            [col for col in merged_wide.columns if col not in {'study', 'insulin_feature'}],
+            key=_time_bin_sort_key
+        )
+        merged_wide = merged_wide[['study', 'insulin_feature'] + time_bin_cols]
+        merged_wide.sort_values(by=['study', 'insulin_feature'], inplace=True)
+        merged_wide.to_csv(output_dir / 'all_studies_insulin_inventory_wide.csv', index=False)
+
+        display_features = [
+            ('basal_ins_dose', 'basal'),
+            ('bolus_ins_dose', 'bolus'),
+            ('total_ins_dose', 'total'),
+            (both_row_label, 'basal+bolus')
+        ]
+        study_by_month_rows = []
+        for df_name, summary_table in sorted(
+            zip(sorted(all_dict.keys()), [table.set_index('insulin_feature').drop(columns='study') for table in merged_wide_tables]),
+            key=lambda item: item[0]
+        ):
+            row = {'study': df_name}
+            for time_bin in time_bin_cols:
+                values = []
+                for feature, label in display_features:
+                    value = (
+                        summary_table.loc[feature, time_bin]
+                        if feature in summary_table.index and time_bin in summary_table.columns
+                        else 'NA'
+                    )
+                    if pd.isna(value) or value == '':
+                        value = 'NA'
+                    values.append(f'{label}: {value}')
+                row[time_bin] = ' | '.join(values)
+            study_by_month_rows.append(row)
+        study_by_month = pd.DataFrame(study_by_month_rows)
+        study_by_month.to_csv(
+            output_dir / 'all_studies_insulin_inventory_study_by_month.csv',
+            index=False
+        )
+
         return None
 
-    def print_metadata(self) -> None:
+    def print_metadata(
+        self,
+        output_dir: str | Path = './data/csv_results/metadata'
+    ) -> None:
         """
         Generate and save per-time-bin metadata presence tables for each study.
 
         For each selected time bin, builds a table showing whether each column has at least
-        one non-null value for that study/time bin; writes CSV files under './data/metadata/'.
+        one non-null value for that study/time bin.
 
         Args:
-            None
+            output_dir: Folder where metadata CSV files are saved.
 
         Returns:
             None: Writes CSV files named 'metadata_{tb}m.csv' to disk.
@@ -5169,12 +7891,13 @@ class DataAnalysis:
         Raises:
             AttributeError: If `self.datasets` is missing.
             KeyError: If required columns ('time_bin', 'id') are absent in any dataset.
-            OSError: If the output directory does not exist or is not writable.
+            OSError: If the output directory cannot be created or written.
         """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
         REQUIRED_COLS = [
             'N', 'diagnose_date', 'glucose mmol/l','age','treatment_arm','insulin_delivery','sex','ethnicity','race',
-            'height','weight', 'hb_a1c', 'hb_a1c_cap', 'hb_a1c_local','total_ins_dose',
-            'basal_ins_dose','bolus_ins_dose','cpep_pre10_min','cpep_0_min','cpep_15_min',
+            'height','weight', 'hb_a1c', 'total_ins_dose', 'basal_ins_dose','bolus_ins_dose','cpep_pre10_min','cpep_0_min','cpep_15_min',
             'cpep_30_min','cpep_60_min','cpep_90_min','cpep_120_min','cpep_auc',
             'glucose_pre10_min','glucose_0_min','glucose_15_min','glucose_30_min',
             'glucose_60_min','glucose_90_min','glucose_120_min','beta2_score',]
@@ -5218,7 +7941,7 @@ class DataAnalysis:
             metadata_table = metadata_table.reset_index()
 
             # write file named by the bin
-            metadata_table.to_csv(f'./data/csv_results/metadata/metadata_{tb}m.csv', index=False)
+            metadata_table.to_csv(output_dir / f'metadata_{tb}m.csv', index=False)
 
     def print_summaries(self) -> None:
         """
@@ -5850,6 +8573,47 @@ class DataAnalysis:
 
         return result
 
+    def get_lmm_diagnostic_record(
+        self,
+        dataset: str,
+        endpoint: str,
+        model_name: str,
+        formula: str,
+        result=None,
+        warning_records: list | None = None,
+        error_message: str = ''
+    ) -> dict[str, object]:
+        warning_records = warning_records or []
+        warning_messages = []
+        warning_categories = []
+        for warning_record in warning_records:
+            warning_messages.append(str(warning_record.message))
+            warning_categories.append(warning_record.category.__name__)
+
+        random_intercept_var = np.nan
+        if result is not None and hasattr(result, 'cov_re'):
+            cov_re = result.cov_re
+            if isinstance(cov_re, pd.DataFrame) and not cov_re.empty:
+                random_intercept_var = float(cov_re.iloc[0, 0])
+            elif np.size(cov_re) > 0:
+                random_intercept_var = float(np.asarray(cov_re).ravel()[0])
+
+        return {
+            'dataset': dataset,
+            'endpoint': endpoint,
+            'model': model_name,
+            'formula': formula,
+            'converged': getattr(result, 'converged', False) if result is not None else False,
+            'random_intercept_var': random_intercept_var,
+            'n_obs': getattr(result, 'nobs', np.nan) if result is not None else np.nan,
+            'llf': getattr(result, 'llf', np.nan) if result is not None else np.nan,
+            'aic': getattr(result, 'aic', np.nan) if result is not None else np.nan,
+            'bic': getattr(result, 'bic', np.nan) if result is not None else np.nan,
+            'warning_categories': ' | '.join(dict.fromkeys(warning_categories)),
+            'warning_messages': ' | '.join(dict.fromkeys(warning_messages)),
+            'error_message': error_message
+        }
+
     def run_likelihood_ratio_test(self, full_result, reduced_result) -> dict[str, float]:
         """
         Compare two nested fitted models using a likelihood ratio test.
@@ -5910,6 +8674,9 @@ class DataAnalysis:
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Run time-adjusted LMMs for C-peptide strata with strict validation.
+
+        Formula strings must use `endpoint` as the left-hand-side placeholder;
+        each endpoint column is copied into that placeholder during model fitting.
         """
         if df.empty:
             raise ValueError("Time-adjusted LMM requires a non-empty DataFrame.")
@@ -5937,6 +8704,21 @@ class DataAnalysis:
                 continue
 
             df_endpoint = df_endpoint.copy()
+            df_endpoint['_endpoint_value'] = df_endpoint[endpoint]
+            endpoint_formulas = {}
+            for formula_name, formula in {
+                'full_formula': full_formula,
+                'reduced_formula': reduced_formula,
+                'trend_formula': trend_formula
+            }.items():
+                lhs, separator, rhs = formula.partition('~')
+                if separator != '~' or lhs.strip() != 'endpoint' or not rhs.strip():
+                    raise ValueError(
+                        f"`{formula_name}` must use `endpoint` as the left-hand side, "
+                        f"for example `endpoint ~ ...`; received: {formula}"
+                    )
+                endpoint_formulas[formula_name] = f"_endpoint_value ~ {rhs.strip()}"
+
             for col in [study_col, stratum_col]:
                 if pd.api.types.is_categorical_dtype(df_endpoint[col]):
                     df_endpoint[col] = df_endpoint[col].cat.remove_unused_categories()
@@ -5958,22 +8740,22 @@ class DataAnalysis:
                 continue
 
             try:
-                full_model = smf.mixedlm(full_formula, df_endpoint, groups=df_endpoint[group_col])
+                full_model = smf.mixedlm(endpoint_formulas['full_formula'], df_endpoint, groups=df_endpoint[group_col])
                 if np.linalg.matrix_rank(full_model.exog) < full_model.exog.shape[1]:
                     raise ValueError(f"Full model design matrix is rank deficient for endpoint '{endpoint}'.")
                 full_result = self.run_linear_mixed_model(
                     df=df_endpoint,
-                    formula=full_formula,
+                    formula=endpoint_formulas['full_formula'],
                     group_col=group_col,
                     reml=False
                 )
 
-                reduced_model = smf.mixedlm(reduced_formula, df_endpoint, groups=df_endpoint[group_col])
+                reduced_model = smf.mixedlm(endpoint_formulas['reduced_formula'], df_endpoint, groups=df_endpoint[group_col])
                 if np.linalg.matrix_rank(reduced_model.exog) < reduced_model.exog.shape[1]:
                     raise ValueError(f"Reduced model design matrix is rank deficient for endpoint '{endpoint}'.")
                 reduced_result = self.run_linear_mixed_model(
                     df=df_endpoint,
-                    formula=reduced_formula,
+                    formula=endpoint_formulas['reduced_formula'],
                     group_col=group_col,
                     reml=False
                 )
@@ -5987,12 +8769,12 @@ class DataAnalysis:
                 })
 
                 df_endpoint['cpep_stratum_num'] = df_endpoint[stratum_col].cat.codes + 1
-                trend_model = smf.mixedlm(trend_formula, df_endpoint, groups=df_endpoint[group_col])
+                trend_model = smf.mixedlm(endpoint_formulas['trend_formula'], df_endpoint, groups=df_endpoint[group_col])
                 if np.linalg.matrix_rank(trend_model.exog) < trend_model.exog.shape[1]:
                     raise ValueError(f"Trend model design matrix is rank deficient for endpoint '{endpoint}'.")
                 trend_result = self.run_linear_mixed_model(
                     df=df_endpoint,
-                    formula=trend_formula,
+                    formula=endpoint_formulas['trend_formula'],
                     group_col=group_col,
                     reml=False
                 )
@@ -6176,7 +8958,13 @@ class DataAnalysis:
     def best_cgm_pct_wear_and_days(self) -> tuple[int, int] | None:
         """
         Compare CGM core endpoints across wear-day windows using 14 days / 70% as reference.
-        Returns the best (wear_prct, wear_days) pair across all studies.
+
+        Saves agreement tables, all-metric Bland-Altman plots, and selected-metric
+        Bland-Altman matrices for 10, 7, 5, and 3 days vs. the 14-day reference.
+
+        Returns:
+            The best (wear_prct, wear_days) pair across all studies, or None if no
+            valid comparison is available.
         """
         wear_days_options = [10, 7, 5, 3]
         wear_prct_options = [70]
@@ -6186,8 +8974,8 @@ class DataAnalysis:
         all_wear_prct = sorted(set(wear_prct_options + [ref_prct]))
 
         dict_dfs = self.datasets.copy()
-        # studies = [name for name in ALL_STUDIES if name in dict_dfs]
-        studies = ['cloud','clvr','diagnode','jaeb_t1d','hupa_ucm']
+        studies = [name for name in ALL_STUDIES if name in dict_dfs]
+        # studies = ['cloud','clvr','diagnode','jaeb_t1d','hupa_ucm']
 
         endpoints_records = []
         endpoints_by_key = {}
@@ -6229,7 +9017,7 @@ class DataAnalysis:
 
         if endpoints_records:
             endpoints_df = pd.concat(endpoints_records, ignore_index=True)
-            output_path = Path("./data/cgm_wear_window_endpoints.csv")
+            output_path = Path("./data/csv_results/cgm_wear/cgm_wear_window_endpoints.csv")
             output_path.parent.mkdir(parents=True, exist_ok=True)
             endpoints_df.to_csv(output_path, index=False)
             print(f"Saved CGM wear window endpoints to {output_path}")
@@ -6262,7 +9050,7 @@ class DataAnalysis:
 
         if overlap_records:
             overlap_df = pd.DataFrame(overlap_records)
-            overlap_path = Path("./data/cgm_wear_window_overlap.csv")
+            overlap_path = Path("./data/csv_results/cgm_wear/cgm_wear_window_overlap.csv")
             overlap_path.parent.mkdir(parents=True, exist_ok=True)
             overlap_df.to_csv(overlap_path, index=False)
             print(f"Saved CGM wear window overlap counts to {overlap_path}")
@@ -6272,6 +9060,7 @@ class DataAnalysis:
         stats_records = []
         tost_records = []
         agreement_records = []
+        ba_plot_records = []
         tost_margins = {
             'gmi': 0.2,
             'TIR': 2.0,
@@ -6281,7 +9070,7 @@ class DataAnalysis:
             'GVP': 2.0,
         }
         tost_alpha = 0.05
-        ba_output_dir = Path("./data/graphs/cgm_wear_window_ba")
+        ba_output_dir = Path("./data/graphs/cgm_wear/bland_altman")
         ba_output_dir.mkdir(parents=True, exist_ok=True)
         mard_eps = 1e-6
 
@@ -6395,24 +9184,20 @@ class DataAnalysis:
                             'ba_loa_upper': loa_upper
                         })
 
-                        plot_path = (
-                            ba_output_dir
-                            / study_name
-                            / metric
-                            / f"wear{wear_days}_prct{wear_prct}_ref{ref_prct}.png"
-                        )
-                        plot_path.parent.mkdir(parents=True, exist_ok=True)
-                        plt.figure(figsize=(6, 4))
-                        plt.scatter(means, diffs, s=12, alpha=0.6)
-                        plt.axhline(bias, color='red', linestyle='--', linewidth=1)
-                        plt.axhline(loa_lower, color='gray', linestyle='--', linewidth=1)
-                        plt.axhline(loa_upper, color='gray', linestyle='--', linewidth=1)
-                        plt.title(f"{study_name} {metric} BA (wear {wear_days} vs ref {ref_prct}%)")
-                        plt.xlabel("(Comp + Ref)/2")
-                        plt.ylabel("Comp - Ref")
-                        plt.tight_layout()
-                        plt.savefig(plot_path, dpi=200)
-                        plt.close()
+                        ba_plot_records.append({
+                            'study': study_name,
+                            'metric': metric,
+                            'wear_days': wear_days,
+                            'wear_prct': wear_prct,
+                            'ref_wear_days': ref_days,
+                            'ref_wear_prct': ref_prct,
+                            'n_pairs': n_pairs,
+                            'means': means,
+                            'diffs': diffs.to_numpy(),
+                            'bias': bias,
+                            'loa_lower': loa_lower,
+                            'loa_upper': loa_upper
+                        })
 
                     if metric in tost_margins and n_pairs >= 2:
                         margin = tost_margins[metric]
@@ -6456,7 +9241,7 @@ class DataAnalysis:
 
         if stats_records:
             stats_df = pd.DataFrame(stats_records)
-            stats_path = Path("./data/cgm_wear_window_stats.csv")
+            stats_path = Path("./data/csv_results/cgm_wear/cgm_wear_window_stats.csv")
             stats_path.parent.mkdir(parents=True, exist_ok=True)
             stats_df.to_csv(stats_path, index=False)
             print(f"Saved CGM wear window stats to {stats_path}")
@@ -6466,7 +9251,7 @@ class DataAnalysis:
 
         if tost_records:
             tost_df = pd.DataFrame(tost_records)
-            tost_path = Path("./data/cgm_wear_window_tost.csv")
+            tost_path = Path("./data/csv_results/cgm_wear/cgm_wear_window_tost.csv")
             tost_path.parent.mkdir(parents=True, exist_ok=True)
             tost_df.to_csv(tost_path, index=False)
             print(f"Saved CGM wear window TOST results to {tost_path}")
@@ -6475,12 +9260,210 @@ class DataAnalysis:
 
         if agreement_records:
             agreement_df = pd.DataFrame(agreement_records)
-            agreement_path = Path("./data/cgm_wear_window_agreement.csv")
+            agreement_path = Path("./data/csv_results/cgm_wear/cgm_wear_window_agreement.csv")
             agreement_path.parent.mkdir(parents=True, exist_ok=True)
             agreement_df.to_csv(agreement_path, index=False)
             print(f"Saved CGM wear window agreement metrics to {agreement_path}")
         else:
             print("No CGM wear window agreement metrics to report.")
+
+        if ba_plot_records:
+            ba_plot_df = pd.DataFrame(ba_plot_records)
+            metric_order = [
+                'TIR', 'TITR', 'gmi', 'median_glucose', 'GVP', 'TAR_Lvl_1',
+                'TAR_Lvl_2', 'TBR_Lvl_1', 'TBR_Lvl_2', 'mean_glucose',
+                'cv_percent', 'std_glucose', 'min_glucose', 'max_glucose',
+                'percent_wear_time'
+            ]
+            for (
+                study_name,
+                wear_days,
+                wear_prct,
+                ref_wear_days,
+                ref_wear_prct
+            ), wear_plots in ba_plot_df.groupby(
+                ['study', 'wear_days', 'wear_prct', 'ref_wear_days', 'ref_wear_prct'],
+                sort=True
+            ):
+                plot_metrics = [
+                    metric for metric in metric_order
+                    if metric in set(wear_plots['metric'])
+                ]
+                plot_metrics.extend(
+                    sorted(set(wear_plots['metric']) - set(plot_metrics))
+                )
+                if not plot_metrics:
+                    continue
+
+                ncols = min(3, len(plot_metrics))
+                nrows = math.ceil(len(plot_metrics) / ncols)
+                fig, axes = plt.subplots(
+                    nrows=nrows,
+                    ncols=ncols,
+                    figsize=(max(4, 3.8 * ncols), max(3, 3.0 * nrows)),
+                    squeeze=False
+                )
+
+                for idx, metric in enumerate(plot_metrics):
+                    row_idx = idx // ncols
+                    col_idx = idx % ncols
+                    ax = axes[row_idx, col_idx]
+                    sub = wear_plots[wear_plots['metric'] == metric]
+                    if sub.empty:
+                        ax.axis('off')
+                        continue
+
+                    plot_row = sub.iloc[0]
+                    ax.scatter(plot_row['means'], plot_row['diffs'], s=10, alpha=0.6)
+                    ax.axhline(plot_row['bias'], color='red', linestyle='--', linewidth=1)
+                    ax.axhline(plot_row['loa_lower'], color='gray', linestyle='--', linewidth=1)
+                    ax.axhline(plot_row['loa_upper'], color='gray', linestyle='--', linewidth=1)
+                    ax.set_title(
+                        f"{metric}\n"
+                        f"n={int(plot_row['n_pairs'])}, bias={plot_row['bias']:.2f}",
+                        fontsize=9
+                    )
+                    if row_idx == nrows - 1:
+                        ax.set_xlabel("(Comp + Ref)/2")
+                    if col_idx == 0:
+                        ax.set_ylabel("Comp - Ref")
+
+                for idx in range(len(plot_metrics), nrows * ncols):
+                    axes[idx // ncols, idx % ncols].axis('off')
+
+                fig.suptitle(
+                    f"{study_name} Bland-Altman plots: "
+                    f"{int(wear_days)}d/{int(wear_prct)}% vs "
+                    f"{int(ref_wear_days)}d/{int(ref_wear_prct)}%",
+                    fontsize=14
+                )
+                fig.tight_layout(rect=[0, 0, 1, 0.98])
+                plot_path = (
+                    ba_output_dir
+                    / study_name
+                    / f"wear{int(wear_days)}_prct{int(wear_prct)}_ref{int(ref_wear_prct)}.png"
+                )
+                plot_path.parent.mkdir(parents=True, exist_ok=True)
+                fig.savefig(plot_path, dpi=200)
+                plt.close(fig)
+            print(f"Saved combined Bland-Altman plots by study and wear window to {ba_output_dir}")
+
+            selected_metrics = ['TIR', 'TITR', 'gmi', 'GVP', 'TAR_Lvl_1', 'TBR_Lvl_1']
+            selected_labels = {
+                'TIR': 'TIR',
+                'TITR': 'TITR',
+                'gmi': 'GMI',
+                'GVP': 'GVP',
+                'TAR_Lvl_1': 'TAR Lvl 1',
+                'TBR_Lvl_1': 'TBR Lvl 1'
+            }
+            selected_output_dir = ba_output_dir / 'selected_metrics_combined'
+
+            for (
+                study_name,
+                wear_prct,
+                ref_wear_days,
+                ref_wear_prct
+            ), study_plots in ba_plot_df.groupby(
+                ['study', 'wear_prct', 'ref_wear_days', 'ref_wear_prct'],
+                sort=True
+            ):
+                plot_wear_days = [
+                    wear_days for wear_days in wear_days_options
+                    if (
+                        (study_plots['wear_days'] == wear_days)
+                        & study_plots['metric'].isin(selected_metrics)
+                    ).any()
+                ]
+                plot_metrics = [
+                    metric for metric in selected_metrics
+                    if metric in set(study_plots['metric'])
+                ]
+                if not plot_wear_days or not plot_metrics:
+                    continue
+
+                nrows = len(plot_wear_days)
+                ncols = len(plot_metrics)
+                fig, axes = plt.subplots(
+                    nrows=nrows,
+                    ncols=ncols,
+                    figsize=(max(7, 3.2 * ncols), max(5, 2.6 * nrows)),
+                    squeeze=False
+                )
+
+                y_limits_by_metric = {}
+                for metric in plot_metrics:
+                    metric_rows = study_plots[study_plots['metric'] == metric]
+                    y_values = []
+                    for _, metric_row in metric_rows.iterrows():
+                        y_values.extend(metric_row['diffs'])
+                        y_values.extend([
+                            metric_row['bias'],
+                            metric_row['loa_lower'],
+                            metric_row['loa_upper']
+                        ])
+                    y_values = pd.Series(y_values).dropna()
+                    if y_values.empty:
+                        continue
+                    y_min = float(y_values.min())
+                    y_max = float(y_values.max())
+                    padding = (y_max - y_min) * 0.08 if y_max > y_min else 1.0
+                    y_limits_by_metric[metric] = (y_min - padding, y_max + padding)
+
+                for row_idx, wear_days in enumerate(plot_wear_days):
+                    for col_idx, metric in enumerate(plot_metrics):
+                        ax = axes[row_idx, col_idx]
+                        sub = study_plots[
+                            (study_plots['wear_days'] == wear_days)
+                            & (study_plots['metric'] == metric)
+                        ]
+                        if sub.empty:
+                            ax.axis('off')
+                            continue
+
+                        plot_row = sub.iloc[0]
+                        ax.scatter(plot_row['means'], plot_row['diffs'], s=9, alpha=0.55)
+                        ax.axhline(plot_row['bias'], color='red', linestyle='--', linewidth=1)
+                        ax.axhline(plot_row['loa_lower'], color='gray', linestyle='--', linewidth=1)
+                        ax.axhline(plot_row['loa_upper'], color='gray', linestyle='--', linewidth=1)
+                        if metric in y_limits_by_metric:
+                            ax.set_ylim(*y_limits_by_metric[metric])
+
+                        if row_idx == 0:
+                            ax.set_title(selected_labels.get(metric, metric), fontsize=10)
+                        if col_idx == 0:
+                            ax.set_ylabel(
+                                f"{int(wear_days)}d vs {int(ref_wear_days)}d\nComp - Ref",
+                                fontsize=9
+                            )
+                        if row_idx == nrows - 1:
+                            ax.set_xlabel("(Comp + Ref)/2", fontsize=9)
+                        ax.text(
+                            0.02,
+                            0.96,
+                            f"n={int(plot_row['n_pairs'])}\nbias={plot_row['bias']:.2f}",
+                            transform=ax.transAxes,
+                            ha='left',
+                            va='top',
+                            fontsize=8
+                        )
+
+                fig.suptitle(
+                    f"{study_name} selected Bland-Altman plots: "
+                    f"{int(wear_prct)}% wear vs "
+                    f"{int(ref_wear_days)}d/{int(ref_wear_prct)}%",
+                    fontsize=14
+                )
+                fig.tight_layout(rect=[0, 0, 1, 0.97])
+                plot_path = (
+                    selected_output_dir
+                    / study_name
+                    / f"selected_wear_windows_prct{int(wear_prct)}_ref{int(ref_wear_prct)}.png"
+                )
+                plot_path.parent.mkdir(parents=True, exist_ok=True)
+                fig.savefig(plot_path, dpi=200)
+                plt.close(fig)
+            print(f"Saved selected-metric Bland-Altman matrices to {selected_output_dir}")
 
         if agreement_records:
             agreement_df = pd.DataFrame(agreement_records)
@@ -6517,7 +9500,7 @@ class DataAnalysis:
                     how='left'
                 )
 
-            summary_dir = Path("./data/csv_results/cgm_wear_window_metric_summaries")
+            summary_dir = Path("./data/csv_results/cgm_wear")
             summary_dir.mkdir(parents=True, exist_ok=True)
             for (wear_days, wear_prct, ref_days, ref_prct), sub in agreement_grouped.groupby(
                 ['wear_days', 'wear_prct', 'ref_wear_days', 'ref_wear_prct']
@@ -6922,7 +9905,11 @@ class DataAnalysis:
             self.plot_spearman_heatmap_from_dfs(dict_t1_dfs_for_plot, clinical_feature=clinical_feat, cgm_features=all_cgm_feats, path=f'./data/graphs/feature_analysis/time_bins/heatmaps/t1_heatmap_{clinical_feat}.png')
             self.plot_spearman_heatmap_from_dfs(dict_t2_dfs_for_plot, clinical_feature=clinical_feat, cgm_features=all_cgm_feats, path=f'./data/graphs/feature_analysis/time_bins/heatmaps/t2_heatmap_{clinical_feat}.png')
 
-    def ht_cpep_strata(self) -> None:
+    def cpep_strata_raw_endpoint_analysis(
+        self,
+        csv_output_root: str | Path = './data/csv_results/hypothesis_tests/cpep_strata_raw',
+        graph_output_root: str | Path = './data/graphs/feature_analysis/cpep_strata_raw'
+    ) -> None:
         """
         Run raw descriptive metabolic-endpoint analyses across C-peptide strata.
 
@@ -6932,16 +9919,20 @@ class DataAnalysis:
             - separates participants into control and active treatment arms
             - compares endpoint distributions across strata within each arm using
               the Kruskal-Wallis test
-            - exports descriptive summary tables and arm-specific figure panels
+            - exports descriptive summary tables, tidy and compact Dunn post hoc
+              tables, and arm-specific figure panels
 
         Args:
-            None
+            csv_output_root: Folder where descriptive and test CSVs are saved.
+            graph_output_root: Folder where arm-specific figure panels are saved.
 
         Returns:
             None: Raw tables and figures are saved to disk.
         """
-        df_cloud = self.get_dataset('cloud').compute()
-        df_clvr = self.get_dataset('clvr').compute()
+        df_cloud = self.get_dataset('cloud')
+        df_clvr = self.get_dataset('clvr')
+        df_cloud = df_cloud.compute() if hasattr(df_cloud, 'compute') else df_cloud.copy()
+        df_clvr = df_clvr.compute() if hasattr(df_clvr, 'compute') else df_clvr.copy()
         if 'insulin_delivery' in df_clvr.columns:
             df_clvr = df_clvr.drop(columns=['treatment_arm'], errors='ignore')
             df_clvr = df_clvr.rename(columns={'insulin_delivery': 'treatment_arm'})
@@ -6962,10 +9953,10 @@ class DataAnalysis:
             endpoint for endpoint in CGM_ENDPOINTS
             if endpoint in FEATURE_LABELS_WITH_UNITS or endpoint in {'GVP'}
         ]
-        output_root = './data/graphs/feature_analysis/cpep_strata_raw'
-        csv_output_root = './data/csv_results/hypothesis_tests/cpep_strata_raw'
-        os.makedirs(output_root, exist_ok=True)
-        os.makedirs(csv_output_root, exist_ok=True)
+        graph_output_root = Path(graph_output_root)
+        csv_output_root = Path(csv_output_root)
+        graph_output_root.mkdir(parents=True, exist_ok=True)
+        csv_output_root.mkdir(parents=True, exist_ok=True)
 
         long_rows = []
         summary_rows = []
@@ -7022,8 +10013,8 @@ class DataAnalysis:
                 ordered=True
             )
 
-            dataset_dir = os.path.join(output_root, dataset_name)
-            os.makedirs(dataset_dir, exist_ok=True)
+            dataset_dir = graph_output_root / dataset_name
+            dataset_dir.mkdir(parents=True, exist_ok=True)
 
             available_endpoints = [col for col in preferred_endpoint_order if col in endpoints.columns]
 
@@ -7199,33 +10190,98 @@ class DataAnalysis:
                 index=False
             )
 
+            posthoc_summary_rows = []
+            contrast_order = [
+                (group_1, group_2)
+                for group_1, group_2 in combinations(cpep_labels, 2)
+            ]
+            for (dataset_name, arm_name, endpoint), endpoint_posthoc in posthoc_df.groupby(
+                ['dataset', 'treatment_arm', 'endpoint'],
+                sort=True
+            ):
+                summary_row = {
+                    'dataset': dataset_name,
+                    'treatment_arm': arm_name,
+                    'endpoint': endpoint,
+                    'kruskal_wallis_p_value': endpoint_posthoc['kruskal_wallis_p_value'].iloc[0]
+                }
+                for group_1, group_2 in contrast_order:
+                    contrast_df = endpoint_posthoc[
+                        (endpoint_posthoc['group_1'] == group_1)
+                        & (endpoint_posthoc['group_2'] == group_2)
+                    ]
+                    contrast_name = f'{group_1} vs {group_2} holm_p'
+                    if contrast_df.empty:
+                        summary_row[contrast_name] = np.nan
+                    else:
+                        summary_row[contrast_name] = contrast_df['p_value_holm'].iloc[0]
+                posthoc_summary_rows.append(summary_row)
+
+            posthoc_summary_df = pd.DataFrame(posthoc_summary_rows)
+            numeric_cols = posthoc_summary_df.select_dtypes(include='number').columns
+            posthoc_summary_df[numeric_cols] = posthoc_summary_df[numeric_cols].round(3)
+            posthoc_summary_df = posthoc_summary_df.sort_values(
+                ['dataset', 'treatment_arm', 'endpoint']
+            )
+            posthoc_summary_df.to_csv(
+                os.path.join(csv_output_root, 'cpep_strata_posthoc_dunn_summary.csv'),
+                index=False
+            )
+
         return None
 
-    def taylor_analysis(self) -> None:
+    def taylor_analysis(
+        self,
+        df: pd.DataFrame,
+        healthy_reference: pd.DataFrame,
+        established_reference: pd.DataFrame
+    ) -> None:
         """
-        Runs the full Taylor-style time bin analysis across all loaded datasets.
+        Runs the full Taylor-style time bin analysis on a prepared pooled dataset.
 
         Workflow:
-            - Splits datasets into positive and negative study groups.
+            - Uses the `study` column to split the pooled dataset into all, positive,
+              and negative study groups.
             - Generates scatterplots of relationships between:
                 1. log(C-peptide AUC) vs clinical/CGM metrics
                 2. Beta2 score vs clinical/CGM metrics
 
+        Args:
+            df: Pooled T1D DataFrame containing `study` and `time_bin`.
+            healthy_reference: Healthy reference DataFrame.
+            established_reference: Established T1D reference DataFrame.
+
         Returns:
             None. Saves scatterplots to ./data/graphs/taylor_analysis/time_bins/.
-        """
-        dict_dfs = self.datasets.copy()
-        allowed_time_bins = ['Baseline', 'Month 3', 'Month 6', 'Month 9', 'Month 12', 'Month 18', 'Month 24']
-        all_dict = {k: v.compute() for k, v in dict_dfs.items() if k in ALL_STUDIES}
-        positive_dict = {k: v.compute() for k, v in dict_dfs.items() if k in POSITIVE_STUDIES}
-        negative_dict = {k: v.compute() for k, v in dict_dfs.items() if k in NEGATIVE_STUDIES}
-        healthy_reference = dict_dfs['jaeb_healthy'].compute()
-        healthy_reference['total_ins_dose'] = 0
-        established_reference = dict_dfs['hupa_ucm'].compute()
 
-        all_dict = {k: df[df['time_bin'].isin(allowed_time_bins)] for k, df in all_dict.items()}
-        positive_dict = {k: df[df['time_bin'].isin(allowed_time_bins)] for k, df in positive_dict.items()}
-        negative_dict = {k: df[df['time_bin'].isin(allowed_time_bins)] for k, df in negative_dict.items()}
+        Raises:
+            ValueError: If required columns are missing or a requested study group
+                has no rows in the allowed Taylor time bins.
+        """
+        allowed_time_bins = ['Baseline', 'Month 3', 'Month 6', 'Month 9', 'Month 12', 'Month 18', 'Month 24']
+        required_cols = {'study', 'time_bin'}
+        missing_cols = required_cols - set(df.columns)
+        if missing_cols:
+            raise ValueError(f"Taylor analysis requires columns: {sorted(missing_cols)}")
+
+        df_taylor = df[
+            df['study'].isin(ALL_STUDIES)
+            & df['time_bin'].isin(allowed_time_bins)
+        ].copy()
+        all_df = df_taylor[df_taylor['study'].isin(ALL_STUDIES)].copy()
+        positive_df = df_taylor[df_taylor['study'].isin(POSITIVE_STUDIES)].copy()
+        negative_df = df_taylor[df_taylor['study'].isin(NEGATIVE_STUDIES)].copy()
+
+        if all_df.empty:
+            raise ValueError("Taylor analysis found no ALL_STUDIES rows in the allowed time bins.")
+        if positive_df.empty:
+            raise ValueError("Taylor analysis found no POSITIVE_STUDIES rows in the allowed time bins.")
+        if negative_df.empty:
+            raise ValueError("Taylor analysis found no NEGATIVE_STUDIES rows in the allowed time bins.")
+
+        healthy_reference = healthy_reference.copy()
+        healthy_reference['total_ins_dose'] = 0
+        established_reference = established_reference.copy()
 
         ''' Part A'''
         # Time analysis
@@ -7233,174 +10289,174 @@ class DataAnalysis:
                  'median_titr','median_tbr_lvl1','median_tbr_lvl2','median_tar_lvl1','median_tar_lvl2']
         metrics = order
         
-        self.plot_taylor_time_bins_graph(dict_df=all_dict, metrics=metrics, path='./data/graphs/taylor_analysis/time_bins/all/')
+        self.plot_taylor_time_bins_graph(df=all_df, metrics=metrics, path='./data/graphs/taylor_analysis/time_bins/all/')
         self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/all/',
                           output='./data/graphs/taylor_analysis/time_bins/all/combined.png',
                           cols=4,
                           ordered_labels=order)
         
-        self.plot_taylor_time_bins_graph(dict_df=positive_dict, metrics=metrics, path='./data/graphs/taylor_analysis/time_bins/positive/')
+        self.plot_taylor_time_bins_graph(df=positive_df, metrics=metrics, path='./data/graphs/taylor_analysis/time_bins/positive/')
         self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/positive/',
                           output='./data/graphs/taylor_analysis/time_bins/positive/combined.png',
                           cols=4,
                           ordered_labels=order)
         
-        self.plot_taylor_time_bins_graph(dict_df=negative_dict, metrics=metrics, path='./data/graphs/taylor_analysis/time_bins/negative/')
+        self.plot_taylor_time_bins_graph(df=negative_df, metrics=metrics, path='./data/graphs/taylor_analysis/time_bins/negative/')
         self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/negative/',
                           output='./data/graphs/taylor_analysis/time_bins/negative/combined.png',
                           cols=4,
                           ordered_labels=order)
 
-        for df_name, df in all_dict.items():
-            self.plot_taylor_time_bins_graph(dict_df={df_name: df}, metrics=metrics, path=f'./data/graphs/taylor_analysis/time_bins/{df_name}/')
+        for df_name, df_study in all_df.groupby('study', sort=True):
+            self.plot_taylor_time_bins_graph(df=df_study.copy(), metrics=metrics, path=f'./data/graphs/taylor_analysis/time_bins/{df_name}/')
             self.combine_pngs(directory=f'./data/graphs/taylor_analysis/time_bins/{df_name}/',
                             output=f'./data/graphs/taylor_analysis/time_bins/{df_name}/combined.png',
                             cols=4,
                             ordered_labels=order)
 
-        # # C-Pep AUC as Independent Value
-        # order = None
-        # x_feature = 'log_cpep_auc'
-        # y_features = ['total_ins_dose', 'beta2_score', 'hb_a1c',
-        #               'TIR', 'TBR_Lvl_1', 'TBR_Lvl_2', 'TAR_Lvl_1', 'TAR_Lvl_2', 'cv_percent']
+        # C-Pep AUC as Independent Value
+        order = None
+        x_feature = 'log_cpep_auc'
+        y_features = ['total_ins_dose', 'beta2_score', 'hb_a1c',
+                      'TIR', 'TBR_Lvl_1', 'TBR_Lvl_2', 'TAR_Lvl_1', 'TAR_Lvl_2', 'cv_percent']
 
-        # self.plot_taylor_time_bins_scatterplot(all_dict,
-        #                                        x_feature=x_feature, y_features=y_features,
-        #                                        path='./data/graphs/taylor_analysis/time_bins/all/scatterplot/cpep_auc/')
-        # self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/all/scatterplot/cpep_auc/',
-        #                 output=f'./data/graphs/taylor_analysis/time_bins/all/scatterplot/cpep_auc/combined.png',
-        #                 cols=4)
+        self.plot_taylor_time_bins_scatterplot(all_df,
+                                               x_feature=x_feature, y_features=y_features,
+                                               path='./data/graphs/taylor_analysis/time_bins/all/scatterplot/cpep_auc/')
+        self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/all/scatterplot/cpep_auc/',
+                        output=f'./data/graphs/taylor_analysis/time_bins/all/scatterplot/cpep_auc/combined.png',
+                        cols=4)
 
-        # self.plot_taylor_time_bins_scatterplot(positive_dict,
-        #                                        x_feature=x_feature, y_features=y_features,
-        #                                        path='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/cpep_auc/')
-        # self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/cpep_auc/',
-        #                 output='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/cpep_auc/combined.png',
-        #                 cols=4)
+        self.plot_taylor_time_bins_scatterplot(positive_df,
+                                               x_feature=x_feature, y_features=y_features,
+                                               path='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/cpep_auc/')
+        self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/cpep_auc/',
+                        output='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/cpep_auc/combined.png',
+                        cols=4)
 
-        # self.plot_taylor_time_bins_scatterplot(negative_dict,
-        #                                        x_feature=x_feature, y_features=y_features,
-        #                                        path='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/cpep_auc/')
-        # self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/cpep_auc/',
-        #                 output='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/cpep_auc/combined.png',
-        #                 cols=4)
+        self.plot_taylor_time_bins_scatterplot(negative_df,
+                                               x_feature=x_feature, y_features=y_features,
+                                               path='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/cpep_auc/')
+        self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/cpep_auc/',
+                        output='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/cpep_auc/combined.png',
+                        cols=4)
 
-        # for df_name, df in all_dict.items():
-        #     self.plot_taylor_time_bins_scatterplot(dict_df={df_name: df},
-        #                                            x_feature=x_feature, y_features=y_features,
-        #                                            path=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/cpep_auc/')
-        #     self.combine_pngs(directory=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/cpep_auc/',
-        #                     output=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/cpep_auc/combined.png',
-        #                     cols=4)
+        for df_name, df_study in all_df.groupby('study', sort=True):
+            self.plot_taylor_time_bins_scatterplot(df_study.copy(),
+                                                   x_feature=x_feature, y_features=y_features,
+                                                   path=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/cpep_auc/')
+            self.combine_pngs(directory=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/cpep_auc/',
+                            output=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/cpep_auc/combined.png',
+                            cols=4)
 
-        # # BETA2 Score as Independent Value
-        # order = None
-        # x_feature = 'beta2_score'
-        # y_features = ['total_ins_dose', 'hb_a1c',
-        #               'TIR', 'TBR_Lvl_1', 'TBR_Lvl_2', 'TAR_Lvl_1', 'TAR_Lvl_2', 'cv_percent']
+        # BETA2 Score as Independent Value
+        order = None
+        x_feature = 'beta2_score'
+        y_features = ['total_ins_dose', 'hb_a1c',
+                      'TIR', 'TBR_Lvl_1', 'TBR_Lvl_2', 'TAR_Lvl_1', 'TAR_Lvl_2', 'cv_percent']
 
-        # self.plot_taylor_time_bins_scatterplot(all_dict,
-        #                                        x_feature=x_feature, y_features=y_features,
-        #                                        path='./data/graphs/taylor_analysis/time_bins/all/scatterplot/beta2_score/')
-        # self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/all/scatterplot/beta2_score/',
-        #                 output='./data/graphs/taylor_analysis/time_bins/all/scatterplot/beta2_score/combined.png',
-        #                 cols=4)
+        self.plot_taylor_time_bins_scatterplot(all_df,
+                                               x_feature=x_feature, y_features=y_features,
+                                               path='./data/graphs/taylor_analysis/time_bins/all/scatterplot/beta2_score/')
+        self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/all/scatterplot/beta2_score/',
+                        output='./data/graphs/taylor_analysis/time_bins/all/scatterplot/beta2_score/combined.png',
+                        cols=4)
 
-        # self.plot_taylor_time_bins_scatterplot(positive_dict,
-        #                                        x_feature=x_feature, y_features=y_features,
-        #                                        path='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/beta2_score/')
-        # self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/beta2_score/',
-        #                 output='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/beta2_score/combined.png',
-        #                 cols=4)
+        self.plot_taylor_time_bins_scatterplot(positive_df,
+                                               x_feature=x_feature, y_features=y_features,
+                                               path='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/beta2_score/')
+        self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/beta2_score/',
+                        output='./data/graphs/taylor_analysis/time_bins/positive/scatterplot/beta2_score/combined.png',
+                        cols=4)
 
-        # self.plot_taylor_time_bins_scatterplot(negative_dict,
-        #                                        x_feature=x_feature, y_features=y_features,
-        #                                        path='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/beta2_score/')
-        # self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/beta2_score/',
-        #                 output='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/beta2_score/combined.png',
-        #                 cols=4)
+        self.plot_taylor_time_bins_scatterplot(negative_df,
+                                               x_feature=x_feature, y_features=y_features,
+                                               path='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/beta2_score/')
+        self.combine_pngs(directory='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/beta2_score/',
+                        output='./data/graphs/taylor_analysis/time_bins/negative/scatterplot/beta2_score/combined.png',
+                        cols=4)
 
-        # for df_name, df in all_dict.items():
-        #     self.plot_taylor_time_bins_scatterplot(dict_df={df_name: df},
-        #                                            x_feature=x_feature, y_features=y_features,
-        #                                            path=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/beta2_score/')
-        #     self.combine_pngs(directory=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/beta2_score/',
-        #                     output=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/beta2_score/combined.png',
-        #                     cols=4)
+        for df_name, df_study in all_df.groupby('study', sort=True):
+            self.plot_taylor_time_bins_scatterplot(df_study.copy(),
+                                                   x_feature=x_feature, y_features=y_features,
+                                                   path=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/beta2_score/')
+            self.combine_pngs(directory=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/beta2_score/',
+                            output=f'./data/graphs/taylor_analysis/time_bins/{df_name}/scatterplot/beta2_score/combined.png',
+                            cols=4)
 
         ''' Part B'''
         metabolic_endpoints = {'hb_a1c', 'gmi', 'TIR', 'TITR', 'total_ins_dose', 'TBR_Lvl_1', 'TBR_Lvl_2', 'TAR_Lvl_1', 'TAR_Lvl_2',
                                'cv_percent', 'GVP'}   
         
-        # # Stratify by absolute Cpeptide
-        # self.taylor_metabolic_endpoints_by_group_total(
-        #     dict_df=all_dict,
-        #     group_by='cpep_auc',
-        #     ranges=[-float('inf'),0.2,0.5,0.8,float('inf')],
-        #     labels=['0-0.2','0.2-0.5','0.5-0.8','0.8<'],
-        #     healthy_reference=healthy_reference,
-        #     established_reference=established_reference,
-        #     metabolic_endpoints=metabolic_endpoints
-        # )
+        # Stratify by absolute Cpeptide
+        self.taylor_metabolic_endpoints_by_group_total(
+            df=all_df,
+            group_by='cpep_auc',
+            ranges=[-float('inf'),0.2,0.5,0.8,float('inf')],
+            labels=['0-0.2','0.2-0.5','0.5-0.8','0.8<'],
+            healthy_reference=healthy_reference,
+            established_reference=established_reference,
+            metabolic_endpoints=metabolic_endpoints
+        )
 
-        # self.taylor_metabolic_endpoints_by_group_time_bins(
-        #     dict_df=all_dict,
-        #     group_by='cpep_auc',
-        #     ranges=[-float('inf'),0.2,0.5,0.8,float('inf')],
-        #     labels=['0-0.2','0.2-0.5','0.5-0.8','0.8<'],
-        #     healthy_reference=healthy_reference,
-        #     established_reference=established_reference,
-        #     metabolic_endpoints=metabolic_endpoints
-        # )
+        self.taylor_metabolic_endpoints_by_group_time_bins(
+            df=all_df,
+            group_by='cpep_auc',
+            ranges=[-float('inf'),0.2,0.5,0.8,float('inf')],
+            labels=['0-0.2','0.2-0.5','0.5-0.8','0.8<'],
+            healthy_reference=healthy_reference,
+            established_reference=established_reference,
+            metabolic_endpoints=metabolic_endpoints
+        )
 
-        # # Stratify by %Cpeptide preservation
-        # self.taylor_metabolic_endpoints_by_group_total(
-        #     dict_df=all_dict,
-        #     group_by='cpep_auc_preservation',
-        #     ranges=[-float('inf'),20,40,60,80,float('inf')],
-        #     labels=['0-20%','20-40%','40-60%','60-80%','80-100%'],
-        #     healthy_reference=healthy_reference,
-        #     established_reference=established_reference,
-        #     metabolic_endpoints=metabolic_endpoints
-        # )
+        # Stratify by %Cpeptide preservation
+        self.taylor_metabolic_endpoints_by_group_total(
+            df=all_df,
+            group_by='cpep_auc_preservation',
+            ranges=[-float('inf'),20,40,60,80,float('inf')],
+            labels=['0-20%','20-40%','40-60%','60-80%','80-100%'],
+            healthy_reference=healthy_reference,
+            established_reference=established_reference,
+            metabolic_endpoints=metabolic_endpoints
+        )
 
-        # self.taylor_metabolic_endpoints_by_group_time_bins(
-        #     dict_df=all_dict,
-        #     group_by='cpep_auc_preservation',
-        #     ranges=[-float('inf'),20,40,60,80,float('inf')],
-        #     labels=['0-20%','20-40%','40-60%','60-80%','80-100%'],
-        #     healthy_reference=healthy_reference,
-        #     established_reference=established_reference,
-        #     metabolic_endpoints=metabolic_endpoints
-        # )
+        self.taylor_metabolic_endpoints_by_group_time_bins(
+            df=all_df,
+            group_by='cpep_auc_preservation',
+            ranges=[-float('inf'),20,40,60,80,float('inf')],
+            labels=['0-20%','20-40%','40-60%','60-80%','80-100%'],
+            healthy_reference=healthy_reference,
+            established_reference=established_reference,
+            metabolic_endpoints=metabolic_endpoints
+        )
 
-        # # Stratify by Beta2 Score
-        # self.taylor_metabolic_endpoints_by_group_total(
-        #     dict_df=all_dict,
-        #     group_by='beta2_score',
-        #     ranges = [-float('inf'),5,10,15,20],
-        #     labels = ['0-5','6-10','11-14','15-20'],
-        #     healthy_reference=healthy_reference,
-        #     established_reference=established_reference,
-        #     metabolic_endpoints=metabolic_endpoints
-        # )
+        # Stratify by Beta2 Score
+        self.taylor_metabolic_endpoints_by_group_total(
+            df=all_df,
+            group_by='beta2_score',
+            ranges = [-float('inf'),5,10,15,20],
+            labels = ['0-5','6-10','11-14','15-20'],
+            healthy_reference=healthy_reference,
+            established_reference=established_reference,
+            metabolic_endpoints=metabolic_endpoints
+        )
 
-        # self.taylor_metabolic_endpoints_by_group_time_bins(
-        #     dict_df=all_dict,
-        #     group_by='beta2_score',
-        #     ranges = [-float('inf'),5,10,15,20],
-        #     labels = ['0-5','6-10','11-14','15-20'],
-        #     healthy_reference=healthy_reference,
-        #     established_reference=established_reference,
-        #     metabolic_endpoints=metabolic_endpoints
-        # )
+        self.taylor_metabolic_endpoints_by_group_time_bins(
+            df=all_df,
+            group_by='beta2_score',
+            ranges = [-float('inf'),5,10,15,20],
+            labels = ['0-5','6-10','11-14','15-20'],
+            healthy_reference=healthy_reference,
+            established_reference=established_reference,
+            metabolic_endpoints=metabolic_endpoints
+        )
 
     def taylor_metabolic_endpoints_by_group_time_bins(
         self,
         group_by: str,
         ranges: list,
         labels: list,
-        dict_df: dict[str, pd.DataFrame],
+        df: pd.DataFrame,
         healthy_reference: pd.DataFrame,
         established_reference: pd.DataFrame,
         metabolic_endpoints: set) -> None:
@@ -7411,7 +10467,7 @@ class DataAnalysis:
             group_by: Column used to create grouping bins.
             ranges: Bin edges for grouping.
             labels: Labels for the group bins.
-            dict_df: Mapping of study name to DataFrame with metabolic endpoints.
+            df: DataFrame with metabolic endpoints.
             healthy_reference: Reference DataFrame for healthy cohort CGM endpoints.
             established_reference: Reference DataFrame for established cohort CGM endpoints.
             metabolic_endpoints: Set of endpoint column names to plot.
@@ -7420,7 +10476,7 @@ class DataAnalysis:
             None
         """
 
-        df_t1d = pd.concat(dict_df.values(), ignore_index=True)
+        df_t1d = df.copy()
         t1d_patient = self.get_taylor_patient_endpoints(
             df_t1d,
             metabolic_endpoints,
@@ -7456,7 +10512,7 @@ class DataAnalysis:
         group_by: str,
         ranges: list,
         labels: list,
-        dict_df: dict[str, pd.DataFrame],
+        df: pd.DataFrame,
         healthy_reference: pd.DataFrame,
         established_reference: pd.DataFrame,
         metabolic_endpoints: set) -> None:
@@ -7467,7 +10523,7 @@ class DataAnalysis:
             group_by: Column used to create grouping bins.
             ranges: Bin edges for grouping.
             labels: Labels for the group bins.
-            dict_df: Mapping of study name to DataFrame with metabolic endpoints.
+            df: DataFrame with metabolic endpoints.
             healthy_reference: Reference DataFrame for healthy cohort CGM endpoints.
             established_reference: Reference DataFrame for established cohort CGM endpoints.
             metabolic_endpoints: Set of endpoint column names to plot.
@@ -7476,7 +10532,7 @@ class DataAnalysis:
             None
         """
 
-        df_t1d = pd.concat(dict_df.values(), ignore_index=True)
+        df_t1d = df.copy()
         t1d_patient = self.get_taylor_patient_endpoints(
             df_t1d,
             metabolic_endpoints,
@@ -7711,85 +10767,291 @@ class DataAnalysis:
 
         return None
 
-    def lmm_cpep_cont_vs_strata(self) -> None:
+    def lmm_cpep_interaction(
+        self,
+        datasets: list[tuple[str, pd.DataFrame | dd.DataFrame]],
+        stratify_by_age: bool = False,
+        adjust_for_time: bool = False,
+        age_cutoff: int = 18,
+        exclude_endpoints: list[str] | None = None,
+        csv_root: str | Path | None = None,
+        graph_root: str | Path | None = None,
+        model1_csv_root: str | Path | None = None,
+        comparison_source: str = 'treatment_arm',
+        reference_values: list[str] | None = None,
+        comparison_values: list[str] | None = None,
+        reference_label: str = 'Standard care',
+        comparison_label: str = 'AID',
+        comparison_name: str = 'treatment-arm'
+    ) -> None:
         """
-        Compare continuous versus stratified C-peptide mixed models by treatment arm.
+        Fit C-peptide interaction models for a configurable two-level comparison.
 
-        Builds endpoint summaries for `cloud`, `clvr`, and their combined dataset, then fits:
-        1. A model using continuous log-transformed C-peptide with treatment interaction.
-        2. A model using categorical C-peptide strata with treatment interaction.
-        The function exports fixed effects, stratum-level contrasts, emmeans, and count tables.
-
-        LMM formulas per endpoint:
-            - Model 1 fixed-effects formula:
-              `endpoint ~ C(treatment_arm) + log_cpep_auc + C(treatment_arm):log_cpep_auc`
-            - Model 2 fixed-effects formula:
-              `endpoint ~ C(treatment_arm) + C(cpep_stratum) + C(treatment_arm):C(cpep_stratum)`
-            - If multiple studies are present, both models add `+ C(study)`
-            - Random intercept: supplied separately via `group_col='id'`
-            - Equivalent mixed-model notation:
-              `endpoint ~ ... + (1 | id)`
+        Fits continuous and categorical C-peptide interaction LMMs with
+        participant random intercepts. Outputs fixed effects, simple slopes,
+        pairwise contrasts by stratum, emmeans, count tables, and figures.
 
         Args:
-            None
+            datasets: `(dataset_name, dataframe)` pairs to analyze. Existing
+                `study` labels are used for study adjustment when more than one
+                study is present.
+            stratify_by_age: If True, fit total, age < cutoff, and age >= cutoff models,
+                saving them under `total`, `less_than_{cutoff}`, and
+                `{cutoff}_or_above` subfolders.
+            adjust_for_time: If True, add `time_months` to both LMMs.
+            age_cutoff: Age threshold for stratified analyses. Defaults to 18.
+            exclude_endpoints: Optional endpoint names to omit from both models.
+            csv_root: Root folder for CSV outputs. Defaults to the legacy LMM folder.
+            graph_root: Root folder for graph outputs. Defaults to the legacy LMM folder.
+            model1_csv_root: Optional folder for official Model 1 fixed-effect and
+                simple-slope CSVs. If omitted, Model 1 CSVs are saved with the other LMM outputs.
+            comparison_source: Column used to define the two comparison groups.
+                Defaults to `treatment_arm`; use `study` for CLOUD vs CLVR combined.
+            reference_values: Raw values mapped to the reference group. Defaults
+                to `TREATMENT_GROUP_1`.
+            comparison_values: Raw values mapped to the comparison group.
+                Defaults to `TREATMENT_GROUP_2`.
+            reference_label: Display label for the reference group.
+            comparison_label: Display label for the comparison group.
+            comparison_name: Human-readable comparison name used in errors/titles.
 
         Returns:
             None
+
+        Raises:
+            ValueError: If required inputs, model support, fitting, contrasts, or
+                expected outputs are missing or invalid. Contrast variances must
+                be finite and non-negative before standard errors are calculated.
         """
-        df_cloud = self.get_dataset('cloud')
-        df_clvr = self.get_dataset('clvr')
-        if 'insulin_delivery' in df_clvr.columns:
-            df_clvr = df_clvr.drop(columns=['treatment_arm'], errors='ignore')
-            df_clvr = df_clvr.rename(columns={'insulin_delivery': 'treatment_arm'})
-            df_clvr.dropna(subset=['treatment_arm'], inplace=True)
-        df_cloud = df_cloud.assign(study='cloud')
-        df_clvr = df_clvr.assign(study='clvr')
-        df_cloud_clvr = pd.concat([df_cloud, df_clvr], ignore_index=True)
+        if not isinstance(age_cutoff, (int, float)) or age_cutoff <= 0:
+            raise ValueError("`age_cutoff` must be a positive number.")
 
-        '''Part 1'''
+        if not datasets:
+            raise ValueError("`datasets` must contain at least one dataset.")
+        exclude_endpoints = set(exclude_endpoints or [])
+        if not isinstance(comparison_source, str) or not comparison_source.strip():
+            raise ValueError("`comparison_source` must be a non-empty string.")
+        comparison_source = comparison_source.strip()
+        reference_values = TREATMENT_GROUP_1 if reference_values is None else reference_values
+        comparison_values = TREATMENT_GROUP_2 if comparison_values is None else comparison_values
+        reference_values = [str(value).strip().lower() for value in reference_values]
+        comparison_values = [str(value).strip().lower() for value in comparison_values]
+        if not reference_values or not comparison_values:
+            raise ValueError("Both comparison groups must contain at least one raw value.")
+        overlap_values = sorted(set(reference_values) & set(comparison_values))
+        if overlap_values:
+            raise ValueError(f"Comparison groups overlap on values: {overlap_values}")
+        reference_label = str(reference_label).strip()
+        comparison_label = str(comparison_label).strip()
+        comparison_name = str(comparison_name).strip()
+        if not reference_label or not comparison_label or not comparison_name:
+            raise ValueError("Comparison labels and name must be non-empty.")
+        contrast_label = f"{comparison_label} - {reference_label}"
+        reference_short_label = 'SC' if reference_label == 'Standard care' else reference_label
+        comparison_short_label = 'AID' if comparison_label == 'AID' else comparison_label
 
-        datasets = [
-            ('cloud', df_cloud),
-            ('clvr', df_clvr),
-            ('cloud_clvr', df_cloud_clvr)
-        ]
+        prepared_datasets = []
+        for dataset_name, df in datasets:
+            base_dataset_name = dataset_name.split('/')[0]
+            if isinstance(df, dd.DataFrame):
+                df = df.compute()
+            else:
+                df = df.copy()
+            if df.empty:
+                raise ValueError(f"{dataset_name}: dataset is empty.")
+            if comparison_source == 'treatment_arm' and 'insulin_delivery' in df.columns and base_dataset_name == 'clvr':
+                df = df.drop(columns=['treatment_arm'], errors='ignore')
+                df = df.rename(columns={'insulin_delivery': 'treatment_arm'})
+                df.dropna(subset=['treatment_arm'], inplace=True)
+            if comparison_source not in df.columns:
+                raise ValueError(
+                    f"{dataset_name}: C-peptide {comparison_name} interaction LMM requires "
+                    f"a '{comparison_source}' column."
+                )
+            prepared_datasets.append((dataset_name, df))
+
+        dataset_names = [name for name, _ in prepared_datasets]
+        if len(dataset_names) != len(set(dataset_names)):
+            raise ValueError(f"Dataset names must be unique; received {dataset_names}.")
+        base_dataset_names = dataset_names.copy()
+
+        datasets = prepared_datasets
+        if stratify_by_age:
+            age_stratified_datasets = []
+            for name, df in datasets:
+                if 'age' not in df.columns:
+                    raise ValueError(f"{name}: age stratification requires an 'age' column.")
+                age_numeric = pd.to_numeric(df['age'], errors='coerce')
+                nonnumeric_age = df['age'].notna() & age_numeric.isna()
+                if nonnumeric_age.any():
+                    unknown_values = sorted(
+                        df.loc[nonnumeric_age, 'age']
+                        .astype(str)
+                        .unique()
+                        .tolist()
+                    )
+                    raise ValueError(
+                        f"{name}: age stratification requires numeric age values; "
+                        f"non-numeric values found: {unknown_values}"
+                    )
+                df_age_source = df.assign(_age_numeric=age_numeric)
+                sort_cols = ['id']
+                if 'timestamp' in df_age_source.columns:
+                    sort_cols.append('timestamp')
+                participant_age = (
+                    df_age_source
+                    .dropna(subset=['_age_numeric'])
+                    .sort_values(by=sort_cols)
+                    .drop_duplicates(subset='id')
+                    .set_index('id')['_age_numeric']
+                )
+                missing_age_ids = sorted(
+                    set(df['id'].dropna().unique()) - set(participant_age.index)
+                )
+                if missing_age_ids:
+                    raise ValueError(
+                        f"{name}: age stratification requires at least one non-missing age "
+                        f"for every participant; missing ids: {missing_age_ids}"
+                    )
+
+                df_total = df.copy()
+                df_total['age_group'] = 'total'
+                df_total['age_stratification_age'] = df_total['id'].map(participant_age)
+                age_stratified_datasets.append((f"{name}/total", df_total))
+
+                cutoff_label = int(age_cutoff) if float(age_cutoff).is_integer() else str(age_cutoff).replace('.', '_')
+                age_groups = [
+                    (f'less_than_{cutoff_label}', participant_age < age_cutoff),
+                    (f'{cutoff_label}_or_above', participant_age >= age_cutoff)
+                ]
+                for age_group_name, age_mask in age_groups:
+                    age_group_ids = participant_age.index[age_mask]
+                    df_age_group = df[df['id'].isin(age_group_ids)].copy()
+                    if df_age_group.empty:
+                        raise ValueError(
+                            f"{name}: age group '{age_group_name}' has no rows for stratified LMM analysis."
+                        )
+                    df_age_group['age_group'] = age_group_name
+                    df_age_group['age_stratification_age'] = df_age_group['id'].map(participant_age)
+                    age_stratified_datasets.append((f"{name}/{age_group_name}", df_age_group))
+            datasets = age_stratified_datasets
+        else:
+            datasets = [(f"{name}/total", df) for name, df in datasets]
+        output_root = 'cont_vs_strata_time_adjusted' if adjust_for_time else 'cont_vs_strata'
+        csv_root = Path(csv_root) if csv_root is not None else Path('./data/csv_results/lmm_results') / output_root
+        graph_root = Path(graph_root) if graph_root is not None else Path('./data/graphs/lmm_results') / output_root
+        model1_csv_root = Path(model1_csv_root) if model1_csv_root is not None else csv_root
+        model1_csv_root.mkdir(parents=True, exist_ok=True)
+        for dataset_name, _ in datasets:
+            (csv_root / dataset_name).mkdir(parents=True, exist_ok=True)
+            (graph_root / dataset_name).mkdir(parents=True, exist_ok=True)
         model1_results = {}
-        model2_results = {}
         model1_summary_rows = []
+        model1_simple_slope_rows = []
+        model2_results = {}
         model2_summary_rows = []
         model2_diff_rows = []
         model2_emmeans_rows = []
+        model2_diffs_for_tables = pd.DataFrame()
+        diagnostics_rows = []
         counts_rows = []
 
-        agp_endpoints = set(CGM_CORE_ENDPOINTS) | {'gmi', 'hb_a1c'}
+        agp_endpoints = (set(CGM_CORE_ENDPOINTS) | {'gmi', 'hb_a1c', 'total_ins_dose'}) - exclude_endpoints
+        model1_simple_slope_endpoints = (set(CGM_CORE_ENDPOINTS) | {'gmi', 'total_ins_dose'}) - exclude_endpoints
+        figure_endpoints = [
+            'TIR',
+            'TITR',
+            'hb_a1c',
+            'gmi',
+            'total_ins_dose',
+            'TBR',
+            'TAR_Lvl_1',
+            'TAR_Lvl_2'
+        ]
+        figure_endpoints = [endpoint for endpoint in figure_endpoints if endpoint not in exclude_endpoints]
+        if not agp_endpoints or not figure_endpoints:
+            raise ValueError(f"Endpoint exclusion removed all endpoints from the {comparison_name} interaction analysis.")
         for name, df in datasets:
+            include_cols = {
+                'cpep_auc',
+                comparison_source,
+                'insulin_delivery',
+                'gmi',
+                'hb_a1c',
+                'total_ins_dose'
+            }
+            if 'study' in df.columns:
+                include_cols.add('study')
             endpoints = self.get_taylor_patient_endpoints(
                 df,
                 metabolic_endpoints=CGM_CORE_ENDPOINTS,
                 by_time_bin=True,
-                include_cols={'study', 'cpep_auc', 'treatment_arm', 'insulin_delivery', 'gmi', 'hb_a1c'})
-            treatment_source = 'treatment_arm'
+                include_cols=include_cols)
+            if endpoints.empty:
+                raise ValueError(f"{name}: endpoint construction produced no rows.")
+            if adjust_for_time:
+                if 'time_bin' not in endpoints.columns:
+                    raise ValueError(f"{name}: time adjustment requires a 'time_bin' column.")
+                time_bin_to_months = {
+                    'Baseline': 0.0,
+                    'Week 6': 1.5,
+                    'Month 3': 3.0,
+                    'Month 6': 6.0,
+                    'Month 9': 9.0,
+                    'Month 12': 12.0,
+                    'Month 15': 15.0,
+                    'Month 18': 18.0,
+                    'Month 21': 21.0,
+                    'Month 24': 24.0
+                }
+                endpoints['time_months'] = endpoints['time_bin'].map(time_bin_to_months)
+                unknown_time_bins = sorted(
+                    endpoints.loc[
+                        endpoints['time_bin'].notna() & endpoints['time_months'].isna(),
+                        'time_bin'
+                    ].astype(str).unique().tolist()
+                )
+                if unknown_time_bins:
+                    raise ValueError(
+                        f"{name}: time adjustment found unmapped time_bin values: {unknown_time_bins}"
+                    )
+            if comparison_source not in endpoints.columns:
+                raise ValueError(f"{name}: endpoint table is missing '{comparison_source}'.")
+            comparison_raw = endpoints[comparison_source].copy()
             endpoints['treatment_arm'] = (
-                endpoints[treatment_source]
+                endpoints[comparison_source]
                 .astype('string')
                 .str.strip()
                 .str.lower()
             )
             endpoints.loc[
-                endpoints['treatment_arm'].isin(TREATMENT_GROUP_1),
+                endpoints['treatment_arm'].isin(reference_values),
                 'treatment_arm'
             ] = 'control'
             endpoints.loc[
-                endpoints['treatment_arm'].isin(TREATMENT_GROUP_2),
+                endpoints['treatment_arm'].isin(comparison_values),
                 'treatment_arm'
             ] = 'active'
             endpoints['treatment_arm'] = pd.Categorical(
                 endpoints['treatment_arm'],
                 categories=['control', 'active']
             )
+            unmapped_comparison = comparison_raw.notna() & endpoints['treatment_arm'].isna()
+            if unmapped_comparison.any():
+                unknown_values = sorted(
+                    comparison_raw.loc[unmapped_comparison]
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                )
+                raise ValueError(
+                    f"{name}: unmapped {comparison_source} values in endpoint table: {unknown_values}"
+                )
             endpoints = endpoints.dropna(subset=['cpep_auc'])
+            if endpoints.empty:
+                raise ValueError(f"{name}: no endpoint rows with non-missing cpep_auc.")
             endpoints['log_cpep_auc'] = np.log(endpoints['cpep_auc'] + 1)
-            cpep_bins = [0.0, 0.2, 0.5, 0.8, 1.0]
+            cpep_bins = [0.0, 0.25, 0.5, 0.75, 1.0]
             endpoints['cpep_stratum'] = pd.cut(
                 endpoints['cpep_auc'],
                 bins=cpep_bins,
@@ -7804,48 +11066,91 @@ class DataAnalysis:
             )
 
             counts_df = endpoints.dropna(subset=['cpep_stratum', 'treatment_arm'])
-            if not counts_df.empty:
-                participants_counts = (
-                    counts_df.groupby(['cpep_stratum', 'treatment_arm'])['id']
-                    .nunique()
-                    .rename('participants')
-                    .reset_index()
+            if counts_df.empty:
+                raise ValueError(
+                    f"{name}: no rows remain after requiring cpep_stratum and {comparison_name} group."
                 )
-                observation_counts = (
-                    counts_df.groupby(['cpep_stratum', 'treatment_arm'])
-                    .size()
-                    .rename('observations')
-                    .reset_index()
-                )
-                counts_summary = pd.merge(
-                    participants_counts,
-                    observation_counts,
-                    on=['cpep_stratum', 'treatment_arm'],
-                    how='outer'
-                )
-                counts_summary['dataset'] = name
-                counts_rows.append(counts_summary)
+            participants_counts = (
+                counts_df.groupby(['cpep_stratum', 'treatment_arm'])['id']
+                .nunique()
+                .rename('participants')
+                .reset_index()
+            )
+            observation_counts = (
+                counts_df.groupby(['cpep_stratum', 'treatment_arm'])
+                .size()
+                .rename('observations')
+                .reset_index()
+            )
+            counts_summary = pd.merge(
+                participants_counts,
+                observation_counts,
+                on=['cpep_stratum', 'treatment_arm'],
+                how='outer'
+            )
+            counts_summary['dataset'] = name
+            counts_rows.append(counts_summary)
 
-            include_study = endpoints['study'].nunique(dropna=True) > 1
+            include_study = (
+                comparison_source != 'study'
+                and 'study' in endpoints.columns
+                and endpoints['study'].nunique(dropna=True) > 1
+            )
             for endpoint in agp_endpoints:
+                if endpoint not in endpoints.columns:
+                    raise ValueError(f"{name}: endpoint table is missing '{endpoint}'.")
+                model_input_cols = [
+                    'id',
+                    'treatment_arm',
+                    'log_cpep_auc',
+                    'cpep_stratum',
+                    endpoint
+                ]
+                if 'study' in endpoints.columns:
+                    model_input_cols.append('study')
+                model1_required = ['treatment_arm', 'log_cpep_auc', endpoint]
+                if adjust_for_time:
+                    model_input_cols.append('time_months')
+                    model1_required.append('time_months')
                 df_endpoint = endpoints[
-                    ['id', 'study', 'treatment_arm', 'log_cpep_auc', 'cpep_stratum', endpoint]
-                ].dropna(subset=['treatment_arm', 'log_cpep_auc', endpoint])
+                    model_input_cols
+                ].dropna(subset=model1_required)
                 if df_endpoint.empty:
-                    continue
+                    raise ValueError(
+                        f"{name} {endpoint}: no rows remain after dropping missing model 1 inputs."
+                    )
+                if df_endpoint['treatment_arm'].nunique(dropna=True) < 2:
+                    raise ValueError(
+                        f"{name} {endpoint}: model 1 requires both {comparison_name} groups."
+                    )
 
                 model1_formula = (
                     f"{endpoint} ~ C(treatment_arm) + log_cpep_auc + "
                     "C(treatment_arm):log_cpep_auc"
                 )
+                if adjust_for_time:
+                    model1_formula += " + time_months"
                 if include_study:
                     model1_formula += " + C(study)"
+                model1_warnings = []
                 try:
-                    model1 = self.run_linear_mixed_model(
-                        df=df_endpoint,
-                        formula=model1_formula,
-                        group_col='id',
-                        reml=False
+                    with warnings.catch_warnings(record=True) as model1_warnings:
+                        warnings.simplefilter('always')
+                        model1 = self.run_linear_mixed_model(
+                            df=df_endpoint,
+                            formula=model1_formula,
+                            group_col='id',
+                            reml=False
+                        )
+                    diagnostics_rows.append(
+                        self.get_lmm_diagnostic_record(
+                            dataset=name,
+                            endpoint=endpoint,
+                            model_name='continuous_cpep',
+                            formula=model1_formula,
+                            result=model1,
+                            warning_records=model1_warnings
+                        )
                     )
                     model1_results[(name, endpoint)] = model1
                     fe_params = model1.fe_params
@@ -7861,24 +11166,119 @@ class DataAnalysis:
                     model1_table['dataset'] = name
                     model1_table['endpoint'] = endpoint
                     model1_summary_rows.append(model1_table)
+
+                    if endpoint in model1_simple_slope_endpoints:
+                        slope_term = 'log_cpep_auc'
+                        interaction_term = 'C(treatment_arm)[T.active]:log_cpep_auc'
+                        if slope_term not in fe_params.index:
+                            raise ValueError(
+                                f"Model 1 for {name} {endpoint} is missing required slope term '{slope_term}'."
+                            )
+                        if interaction_term not in fe_params.index:
+                            raise ValueError(
+                                f"Model 1 for {name} {endpoint} is missing required interaction term '{interaction_term}'."
+                            )
+                        cov_params = model1.cov_params()
+                        if isinstance(cov_params, pd.DataFrame):
+                            cov_fe = cov_params.loc[fe_params.index, fe_params.index]
+                        else:
+                            cov_fe = pd.DataFrame(
+                                cov_params[:len(fe_params), :len(fe_params)],
+                                index=fe_params.index,
+                                columns=fe_params.index
+                            )
+                        simple_slope_contrasts = {
+                            'control': {slope_term: 1.0},
+                            'active': {slope_term: 1.0, interaction_term: 1.0}
+                        }
+                        for arm, contrast_terms in simple_slope_contrasts.items():
+                            contrast = pd.Series(0.0, index=fe_params.index)
+                            for term, weight in contrast_terms.items():
+                                contrast.loc[term] = weight
+                            slope_estimate = float(contrast @ fe_params)
+                            slope_se = float(np.sqrt(contrast.to_numpy() @ cov_fe.to_numpy() @ contrast.to_numpy().T))
+                            if not np.isfinite(slope_se) or slope_se <= 0:
+                                raise ValueError(
+                                    f"Model 1 simple slope for {name} {endpoint} arm '{arm}' has invalid standard error."
+                                )
+                            slope_z = slope_estimate / slope_se
+                            slope_p = 2 * norm.sf(abs(slope_z))
+                            if not np.isfinite(slope_p):
+                                raise ValueError(
+                                    f"Model 1 simple slope for {name} {endpoint} arm '{arm}' produced an invalid p-value."
+                                )
+                            model1_simple_slope_rows.append({
+                                'dataset': name,
+                                'endpoint': endpoint,
+                                'treatment_arm': arm,
+                                'estimate': slope_estimate,
+                                'standard_error': slope_se,
+                                'ci_lower': slope_estimate - 1.96 * slope_se,
+                                'ci_upper': slope_estimate + 1.96 * slope_se,
+                                'p_value': slope_p
+                            })
                 except Exception as exc:
-                    print(f"Model 1 failed for {name} {endpoint}: {exc}")
+                    diagnostics_rows.append(
+                        self.get_lmm_diagnostic_record(
+                            dataset=name,
+                            endpoint=endpoint,
+                            model_name='continuous_cpep',
+                            formula=model1_formula,
+                            warning_records=model1_warnings,
+                            error_message=str(exc)
+                        )
+                    )
+                    raise ValueError(f"Model 1 failed for {name} {endpoint}: {exc}") from exc
 
                 df_endpoint_strata = df_endpoint.dropna(subset=['cpep_stratum'])
                 if df_endpoint_strata.empty:
-                    continue
+                    raise ValueError(
+                        f"{name} {endpoint}: no rows remain after dropping missing cpep_stratum."
+                    )
+                strata_arm_counts = (
+                    df_endpoint_strata
+                    .groupby(['cpep_stratum', 'treatment_arm'], observed=False)
+                    .size()
+                    .rename('n')
+                    .reset_index()
+                )
+                missing_strata_arm = strata_arm_counts[strata_arm_counts['n'] == 0]
+                if not missing_strata_arm.empty:
+                    missing_pairs = [
+                        f"stratum={row.cpep_stratum}, arm={row.treatment_arm}"
+                        for row in missing_strata_arm.itertuples(index=False)
+                    ]
+                    raise ValueError(
+                        f"{name} {endpoint}: model 2 requires every C-peptide stratum "
+                        f"to include both {comparison_name} groups; missing {missing_pairs}."
+                    )
                 model2_formula = (
                     f"{endpoint} ~ C(treatment_arm) + C(cpep_stratum) + "
                     "C(treatment_arm):C(cpep_stratum)"
                 )
+                if adjust_for_time:
+                    model2_formula += " + time_months"
                 if include_study:
                     model2_formula += " + C(study)"
+                model2_warnings = []
                 try:
-                    model2 = self.run_linear_mixed_model(
-                        df=df_endpoint_strata,
-                        formula=model2_formula,
-                        group_col='id',
-                        reml=False
+                    with warnings.catch_warnings(record=True) as model2_warnings:
+                        warnings.simplefilter('always')
+                        model2 = self.run_linear_mixed_model(
+                            df=df_endpoint_strata,
+                            formula=model2_formula,
+                            group_col='id',
+                            reml=False
+                        )
+                    diagnostics_rows.append(
+                        self.get_lmm_diagnostic_record(
+                            dataset=name,
+                            endpoint=endpoint,
+                            model_name='cpep_strata',
+                            formula=model2_formula,
+                            result=model2,
+                            warning_records=model2_warnings
+                        )
                     )
                     model2_results[(name, endpoint)] = model2
                     fe_params = model2.fe_params
@@ -7901,32 +11301,74 @@ class DataAnalysis:
                         cov_fe = cov_params.loc[fe_params.index, fe_params.index]
                     else:
                         cov_fe = cov_params[:len(fe_params), :len(fe_params)]
-                    if include_study:
-                        study_weights = (
+                    if include_study and adjust_for_time:
+                        adjustment_weights = (
+                            df_endpoint_strata
+                            .groupby(['study', 'time_months'], observed=True)
+                            .size()
+                            .rename('n')
+                            .reset_index()
+                        )
+                        adjustment_weights['weight'] = (
+                            adjustment_weights['n'] / adjustment_weights['n'].sum()
+                        )
+                    elif adjust_for_time:
+                        adjustment_weights = (
+                            df_endpoint_strata
+                            .groupby(['time_months'], observed=True)
+                            .size()
+                            .rename('n')
+                            .reset_index()
+                        )
+                        adjustment_weights['weight'] = (
+                            adjustment_weights['n'] / adjustment_weights['n'].sum()
+                        )
+                    elif include_study:
+                        adjustment_weights = (
                             df_endpoint_strata['study']
                             .value_counts(normalize=True, sort=False)
-                            .to_dict()
+                            .rename_axis('study')
+                            .reset_index(name='weight')
                         )
                     else:
-                        study_weights = {df_endpoint_strata['study'].iloc[0]: 1.0}
+                        adjustment_weights = pd.DataFrame({'weight': [1.0]})
 
                     stratum_levels = df_endpoint_strata['cpep_stratum'].cat.categories
                     diff_rows = []
                     for level in stratum_levels:
                         if level not in df_endpoint_strata['cpep_stratum'].values:
-                            continue
-                        design_df = pd.DataFrame({
+                            raise ValueError(
+                                f"{name} {endpoint}: cpep_stratum {level} has no rows for model 2."
+                            )
+                        design_rows = []
+                        for weight_row in adjustment_weights.itertuples(index=False):
+                            for arm in ['control', 'active']:
+                                row = {
+                                    'treatment_arm': arm,
+                                    'cpep_stratum': level,
+                                    '_weight': weight_row.weight
+                                }
+                                if include_study:
+                                    row['study'] = weight_row.study
+                                if adjust_for_time:
+                                    row['time_months'] = weight_row.time_months
+                                design_rows.append(row)
+                        design_data = {
                             'treatment_arm': pd.Categorical(
-                                ['control', 'active'] * len(study_weights),
+                                [row['treatment_arm'] for row in design_rows],
                                 categories=['control', 'active']
                             ),
                             'cpep_stratum': pd.Categorical(
-                                [level] * (2 * len(study_weights)),
+                                [row['cpep_stratum'] for row in design_rows],
                                 categories=stratum_levels,
                                 ordered=True
-                            ),
-                            'study': list(study_weights.keys()) * 2
-                        })
+                            )
+                        }
+                        if include_study:
+                            design_data['study'] = [row['study'] for row in design_rows]
+                        design_df = pd.DataFrame(design_data)
+                        if adjust_for_time:
+                            design_df['time_months'] = [row['time_months'] for row in design_rows]
                         exog = patsy.build_design_matrices(
                             [design_info],
                             design_df,
@@ -7934,17 +11376,30 @@ class DataAnalysis:
                         )[0]
                         active_mask = design_df['treatment_arm'] == 'active'
                         control_mask = design_df['treatment_arm'] == 'control'
-                        weights = np.array([study_weights[s] for s in design_df['study']])
+                        weights = np.array([row['_weight'] for row in design_rows])
                         weights_active = weights[active_mask]
                         weights_control = weights[control_mask]
                         weights_active = weights_active / weights_active.sum()
                         weights_control = weights_control / weights_control.sum()
                         x_active = (exog.to_numpy()[active_mask] * weights_active[:, None]).sum(axis=0)
                         x_control = (exog.to_numpy()[control_mask] * weights_control[:, None]).sum(axis=0)
+                        cov_fe_values = cov_fe.to_numpy()
                         mean_control = float(x_control @ fe_params.to_numpy())
                         mean_active = float(x_active @ fe_params.to_numpy())
-                        se_control = float(np.sqrt(x_control @ cov_fe.to_numpy() @ x_control.T))
-                        se_active = float(np.sqrt(x_active @ cov_fe.to_numpy() @ x_active.T))
+                        var_control = float(x_control @ cov_fe_values @ x_control.T)
+                        var_active = float(x_active @ cov_fe_values @ x_active.T)
+                        if not np.isfinite(var_control) or var_control < 0:
+                            raise ValueError(
+                                f"{name} {endpoint} {level}: control adjusted-mean contrast "
+                                f"has invalid variance {var_control}."
+                            )
+                        if not np.isfinite(var_active) or var_active < 0:
+                            raise ValueError(
+                                f"{name} {endpoint} {level}: active adjusted-mean contrast "
+                                f"has invalid variance {var_active}."
+                            )
+                        se_control = float(np.sqrt(var_control))
+                        se_active = float(np.sqrt(var_active))
                         model2_emmeans_rows.append({
                             'dataset': name,
                             'endpoint': endpoint,
@@ -7965,12 +11420,18 @@ class DataAnalysis:
                         })
                         diff = x_active - x_control
                         diff_est = float(diff @ fe_params.to_numpy())
-                        diff_se = float(np.sqrt(diff @ cov_fe.to_numpy() @ diff.T))
-                        z_stat = diff_est / diff_se if diff_se > 0 else np.nan
-                        diff_p = 2 * norm.sf(abs(z_stat)) if np.isfinite(z_stat) else np.nan
+                        diff_var = float(diff @ cov_fe_values @ diff.T)
+                        if not np.isfinite(diff_var) or diff_var <= 0:
+                            raise ValueError(
+                                f"{name} {endpoint} {level}: treatment contrast has invalid "
+                                f"variance {diff_var}."
+                            )
+                        diff_se = float(np.sqrt(diff_var))
+                        z_stat = diff_est / diff_se
+                        diff_p = 2 * norm.sf(abs(z_stat))
                         diff_rows.append({
                             'cpep_stratum': level,
-                            'treatment_minus_control': diff_est,
+                            'comparison_minus_reference': diff_est,
                             'ci_lower': diff_est - 1.96 * diff_se,
                             'ci_upper': diff_est + 1.96 * diff_se,
                             'p_value': diff_p
@@ -7980,8 +11441,31 @@ class DataAnalysis:
                         diff_df['dataset'] = name
                         diff_df['endpoint'] = endpoint
                         model2_diff_rows.append(diff_df)
+                    else:
+                        raise ValueError(f"{name} {endpoint}: model 2 produced no stratum contrasts.")
                 except Exception as exc:
-                    print(f"Model 2 failed for {name} {endpoint}: {exc}")
+                    diagnostics_rows.append(
+                        self.get_lmm_diagnostic_record(
+                            dataset=name,
+                            endpoint=endpoint,
+                            model_name='cpep_strata',
+                            formula=model2_formula,
+                            warning_records=model2_warnings,
+                            error_message=str(exc)
+                        )
+                    )
+                    raise ValueError(f"Model 2 failed for {name} {endpoint}: {exc}") from exc
+
+        if diagnostics_rows:
+            diagnostics_df = pd.DataFrame(diagnostics_rows)
+            diagnostics_numeric = diagnostics_df.select_dtypes(include='number').columns
+            diagnostics_df[diagnostics_numeric] = diagnostics_df[diagnostics_numeric].round(6)
+            diagnostics_df.to_csv(
+                f'{csv_root}/model_diagnostics.csv',
+                index=False
+            )
+        else:
+            raise ValueError("No LMM diagnostics were produced.")
 
         if counts_rows:
             counts_all = pd.concat(counts_rows, ignore_index=True)
@@ -7990,9 +11474,12 @@ class DataAnalysis:
             counts_all = counts_all.sort_values(['dataset', 'cpep_stratum', 'treatment_arm'])
             for dataset_name in counts_all['dataset'].unique():
                 counts_all[counts_all['dataset'] == dataset_name].to_csv(
-                    f'./data/csv_results/lmm_results/cont_vs_strata/counts_by_stratum_{dataset_name}.csv',
+                    f'{csv_root}/{dataset_name}/counts_by_stratum.csv',
                     index=False
                 )
+        else:
+            raise ValueError("No C-peptide stratum count tables were produced.")
+
         if model1_summary_rows:
             model1_all = pd.concat(model1_summary_rows, ignore_index=True)
             model1_cols = ['dataset', 'endpoint', 'term', 'estimate', 'ci_lower', 'ci_upper', 'p_value']
@@ -8004,7 +11491,7 @@ class DataAnalysis:
                 model1_all['p_value'] = model1_pvals.apply(
                     lambda p: "<0.001" if pd.notna(p) and p < 0.001 else (f"{p:.3f}" if pd.notna(p) else p)
                 )
-            preferred_endpoints = ['TIR', 'TITR', 'hb_a1c', 'gmi']
+            preferred_endpoints = figure_endpoints
             endpoints_present = model1_all['endpoint'].dropna().unique().tolist()
             ordered_endpoints = (
                 [e for e in preferred_endpoints if e in endpoints_present] +
@@ -8016,11 +11503,81 @@ class DataAnalysis:
                 ordered=True
             )
             model1_all = model1_all.sort_values(['dataset', 'endpoint', 'term'])
-            for dataset_name in model1_all['dataset'].unique():
-                model1_all[model1_all['dataset'] == dataset_name].to_csv(
-                    f'./data/csv_results/lmm_results/cont_vs_strata/model1_fixed_effects_{dataset_name}.csv',
-                    index=False
+            if model1_simple_slope_rows:
+                model1_simple_slopes_all = pd.DataFrame(model1_simple_slope_rows)
+                simple_slope_pvals = (
+                    model1_simple_slopes_all['p_value']
+                    if 'p_value' in model1_simple_slopes_all.columns
+                    else None
                 )
+                simple_slope_numeric = [
+                    c for c in model1_simple_slopes_all.select_dtypes(include='number').columns
+                    if c != 'p_value'
+                ]
+                model1_simple_slopes_all[simple_slope_numeric] = model1_simple_slopes_all[simple_slope_numeric].round(2)
+                if simple_slope_pvals is not None:
+                    model1_simple_slopes_all['p_value'] = simple_slope_pvals.apply(
+                        lambda p: "<0.001" if pd.notna(p) and p < 0.001 else (f"{p:.3f}" if pd.notna(p) else p)
+                    )
+                model1_simple_slopes_all['endpoint'] = pd.Categorical(
+                    model1_simple_slopes_all['endpoint'],
+                    categories=ordered_endpoints,
+                    ordered=True
+                )
+                model1_simple_slopes_all['treatment_arm'] = pd.Categorical(
+                    model1_simple_slopes_all['treatment_arm'],
+                    categories=['control', 'active'],
+                    ordered=True
+                )
+                model1_simple_slopes_all = model1_simple_slopes_all.sort_values(
+                    ['dataset', 'endpoint', 'treatment_arm']
+                )
+            else:
+                raise ValueError("No Model 1 simple-slope summaries were produced.")
+
+            for dataset_name in model1_all['dataset'].unique():
+                dataset_model1 = model1_all[model1_all['dataset'] == dataset_name].copy()
+                dataset_simple_slopes = model1_simple_slopes_all[
+                    model1_simple_slopes_all['dataset'] == dataset_name
+                ].copy()
+                if dataset_simple_slopes.empty:
+                    raise ValueError(f"{dataset_name}: no Model 1 simple slopes available for table output.")
+                model1_dataset_dir = model1_csv_root / dataset_name
+                model1_dataset_dir.mkdir(parents=True, exist_ok=True)
+                model1_out = model1_dataset_dir / 'model1_fixed_effects.csv'
+                simple_slope_out = model1_dataset_dir / 'model1_simple_slopes.csv'
+                if model1_csv_root == csv_root:
+                    model1_out = csv_root / dataset_name / 'model1_fixed_effects.csv'
+                    simple_slope_out = csv_root / dataset_name / 'model1_simple_slopes.csv'
+                dataset_model1.to_csv(model1_out, index=False)
+                dataset_simple_slopes.to_csv(simple_slope_out, index=False)
+                fixed_effect_term_labels = {
+                    'Intercept': f'Reference mean\n{reference_label}\nat model reference',
+                    'C(treatment_arm)[T.active]': f'{contrast_label}\nat model reference',
+                    'C(treatment_arm)[T.active]:log_cpep_auc': f'{contrast_label}\nslope difference'
+                }
+                fixed_effect_term_order = [
+                    'Endpoint/terms',
+                    f'Reference mean\n{reference_label}\nat model reference',
+                    f'{contrast_label}\nat model reference',
+                    f'{contrast_label}\nslope difference'
+                ]
+                self.plot_lmm_model1_fixed_effects_with_slopes_table(
+                    dataset_model1,
+                    dataset_simple_slopes,
+                    figure_endpoints,
+                    fixed_effect_term_labels,
+                    fixed_effect_term_order,
+                    f'{graph_root}/{dataset_name}/model1_fixed_effects_table.png',
+                    f'{dataset_name}: continuous model C-peptide slopes',
+                    slope_labels={
+                        'control': f'C-peptide slope\n{reference_label}',
+                        'active': f'C-peptide slope\n{comparison_label}'
+                    }
+                )
+        else:
+            raise ValueError("No Model 1 fixed-effect summaries were produced.")
+
         if model2_summary_rows:
             model2_all = pd.concat(model2_summary_rows, ignore_index=True)
             model2_cols = ['dataset', 'endpoint', 'term', 'estimate', 'ci_lower', 'ci_upper', 'p_value']
@@ -8032,7 +11589,7 @@ class DataAnalysis:
                 model2_all['p_value'] = model2_pvals.apply(
                     lambda p: "<0.001" if pd.notna(p) and p < 0.001 else (f"{p:.3f}" if pd.notna(p) else p)
                 )
-            preferred_endpoints = ['TIR', 'TITR', 'hb_a1c', 'gmi']
+            preferred_endpoints = figure_endpoints
             endpoints_present = model2_all['endpoint'].dropna().unique().tolist()
             ordered_endpoints = (
                 [e for e in preferred_endpoints if e in endpoints_present] +
@@ -8045,10 +11602,44 @@ class DataAnalysis:
             )
             model2_all = model2_all.sort_values(['dataset', 'endpoint', 'term'])
             for dataset_name in model2_all['dataset'].unique():
-                model2_all[model2_all['dataset'] == dataset_name].to_csv(
-                    f'./data/csv_results/lmm_results/cont_vs_strata/model2_fixed_effects_{dataset_name}.csv',
+                dataset_model2 = model2_all[model2_all['dataset'] == dataset_name].copy()
+                dataset_model2.to_csv(
+                    f'{csv_root}/{dataset_name}/model2_fixed_effects.csv',
                     index=False
                 )
+                fixed_effect_term_labels = {
+                    'C(cpep_stratum)[T.2]': 'C-peptide stratum\n2 vs 1',
+                    'C(cpep_stratum)[T.3]': 'C-peptide stratum\n3 vs 1',
+                    'C(cpep_stratum)[T.4]': 'C-peptide stratum\n4 vs 1',
+                    'C(treatment_arm)[T.active]': f'{comparison_name.capitalize()} effect\nin stratum 1',
+                    'C(treatment_arm)[T.active]:C(cpep_stratum)[T.2]': f'{comparison_name.capitalize()}-effect modification\nstratum 2 vs 1',
+                    'C(treatment_arm)[T.active]:C(cpep_stratum)[T.3]': f'{comparison_name.capitalize()}-effect modification\nstratum 3 vs 1',
+                    'C(treatment_arm)[T.active]:C(cpep_stratum)[T.4]': f'{comparison_name.capitalize()}-effect modification\nstratum 4 vs 1',
+                    'Intercept': f'Reference mean\n{reference_label} stratum 1'
+                }
+                fixed_effect_term_order = [
+                    'Endpoint/terms',
+                    f'Reference mean\n{reference_label} stratum 1',
+                    'C-peptide stratum\n2 vs 1',
+                    'C-peptide stratum\n3 vs 1',
+                    'C-peptide stratum\n4 vs 1',
+                    f'{comparison_name.capitalize()} effect\nin stratum 1',
+                    f'{comparison_name.capitalize()}-effect modification\nstratum 2 vs 1',
+                    f'{comparison_name.capitalize()}-effect modification\nstratum 3 vs 1',
+                    f'{comparison_name.capitalize()}-effect modification\nstratum 4 vs 1'
+                ]
+                self.plot_lmm_fixed_effects_table(
+                    dataset_model2,
+                    figure_endpoints,
+                    fixed_effect_term_labels,
+                    fixed_effect_term_order,
+                    f'Reference mean\n{reference_label} stratum 1',
+                    f'{graph_root}/{dataset_name}/model2_fixed_effects_table.png',
+                    f'{dataset_name}: strata model fixed effects'
+                )
+        else:
+            raise ValueError("No Model 2 fixed-effect summaries were produced.")
+
         if model2_diff_rows:
             model2_diffs_all = pd.concat(model2_diff_rows, ignore_index=True)
             diff_pvals = model2_diffs_all['p_value'] if 'p_value' in model2_diffs_all.columns else None
@@ -8062,13 +11653,13 @@ class DataAnalysis:
                 'dataset',
                 'endpoint',
                 'cpep_stratum',
-                'treatment_minus_control',
+                'comparison_minus_reference',
                 'ci_lower',
                 'ci_upper',
                 'p_value'
             ]
             model2_diffs_all = model2_diffs_all[[c for c in diff_cols if c in model2_diffs_all.columns]]
-            preferred_endpoints = ['TIR', 'TITR', 'hb_a1c', 'gmi']
+            preferred_endpoints = figure_endpoints
             endpoints_present = model2_diffs_all['endpoint'].dropna().unique().tolist()
             ordered_endpoints = (
                 [e for e in preferred_endpoints if e in endpoints_present] +
@@ -8080,16 +11671,20 @@ class DataAnalysis:
                 ordered=True
             )
             model2_diffs_all = model2_diffs_all.sort_values(['dataset', 'endpoint', 'cpep_stratum'])
+            model2_diffs_for_tables = model2_diffs_all.copy()
             for dataset_name in model2_diffs_all['dataset'].unique():
                 model2_diffs_all[model2_diffs_all['dataset'] == dataset_name].to_csv(
-                    f'./data/csv_results/lmm_results/cont_vs_strata/model2_stratum_diffs_{dataset_name}.csv',
+                    f'{csv_root}/{dataset_name}/model2_stratum_diffs.csv',
                     index=False
                 )
+        else:
+            raise ValueError(f"No Model 2 stratum {comparison_name} contrasts were produced.")
+
         if model2_emmeans_rows:
             model2_emmeans_all = pd.DataFrame(model2_emmeans_rows)
             emmeans_numeric = model2_emmeans_all.select_dtypes(include='number').columns
             model2_emmeans_all[emmeans_numeric] = model2_emmeans_all[emmeans_numeric].round(2)
-            preferred_endpoints = ['TIR', 'TITR', 'hb_a1c', 'gmi']
+            preferred_endpoints = figure_endpoints
             endpoints_present = model2_emmeans_all['endpoint'].dropna().unique().tolist()
             ordered_endpoints = (
                 [e for e in preferred_endpoints if e in endpoints_present] +
@@ -8105,9 +11700,213 @@ class DataAnalysis:
             )
             for dataset_name in model2_emmeans_all['dataset'].unique():
                 model2_emmeans_all[model2_emmeans_all['dataset'] == dataset_name].to_csv(
-                    f'./data/csv_results/lmm_results/cont_vs_strata/model2_emmeans_{dataset_name}.csv',
+                    f'{csv_root}/{dataset_name}/model2_emmeans.csv',
                     index=False
                 )
+
+            plot_root = Path(graph_root)
+            stratum_labels = {
+                1: '0-0.25',
+                2: '0.25-0.5',
+                3: '0.5-0.75',
+                4: '0.75-1.0'
+            }
+            arm_labels = {
+                'control': reference_label,
+                'active': comparison_label
+            }
+            arm_order = ['control', 'active']
+            arm_colors = {
+                'control': '#4C78A8',
+                'active': '#F58518'
+            }
+
+            for dataset_name in model2_emmeans_all['dataset'].dropna().unique():
+                dataset_df = model2_emmeans_all[model2_emmeans_all['dataset'] == dataset_name].copy()
+                endpoints_to_plot = [
+                    endpoint for endpoint in figure_endpoints
+                    if endpoint in set(dataset_df['endpoint'].astype(str))
+                ]
+                if not endpoints_to_plot:
+                    raise ValueError(f"{dataset_name}: no figure endpoints available for Model 2 emmeans plots.")
+
+                dataset_plot_dir = plot_root / str(dataset_name)
+                table_df = dataset_df.copy()
+                table_df['estimate_ci'] = table_df.apply(
+                    lambda row: f"{row['emmeans']:.2f} ({row['ci_lower']:.2f}, {row['ci_upper']:.2f})",
+                    axis=1
+                )
+                table_df['treatment_arm'] = table_df['treatment_arm'].map(arm_labels)
+                comparison_table = (
+                    table_df.pivot_table(
+                        index=['endpoint', 'cpep_stratum'],
+                        columns='treatment_arm',
+                        values='estimate_ci',
+                        aggfunc='first',
+                        observed=False
+                    )
+                    .reset_index()
+                )
+                if not model2_diffs_for_tables.empty:
+                    diff_table = model2_diffs_for_tables[
+                        model2_diffs_for_tables['dataset'] == dataset_name
+                    ].copy()
+                    if diff_table.empty:
+                        raise ValueError(f"{dataset_name}: no Model 2 stratum contrasts available for table output.")
+                    diff_table[contrast_label] = diff_table.apply(
+                        lambda row: (
+                            f"{row['comparison_minus_reference']:.2f} "
+                            f"({row['ci_lower']:.2f}, {row['ci_upper']:.2f})"
+                        ),
+                        axis=1
+                    )
+                    diff_table = diff_table[
+                        ['endpoint', 'cpep_stratum', contrast_label, 'p_value']
+                    ].rename(columns={'p_value': 'p'})
+                    comparison_table = comparison_table.merge(
+                        diff_table,
+                        on=['endpoint', 'cpep_stratum'],
+                        how='left'
+                    )
+                else:
+                    raise ValueError("Model 2 stratum contrasts are required for adjusted means tables.")
+
+                comparison_table['endpoint'] = comparison_table['endpoint'].astype(str)
+                comparison_table['cpep_stratum'] = comparison_table['cpep_stratum'].map(stratum_labels)
+                comparison_table = comparison_table.rename(
+                    columns={
+                        'endpoint': 'Endpoint',
+                        'cpep_stratum': 'C-peptide stratum'
+                    }
+                )
+                ordered_table_cols = [
+                    'Endpoint',
+                    'C-peptide stratum',
+                    reference_label,
+                    comparison_label,
+                    contrast_label,
+                    'p'
+                ]
+                comparison_table = comparison_table[
+                    [col for col in ordered_table_cols if col in comparison_table.columns]
+                ]
+                comparison_table['cell_text'] = comparison_table.apply(
+                    lambda row: (
+                        f"{reference_short_label}: {row.get(reference_label, '')}\n"
+                        f"{comparison_short_label}: {row.get(comparison_label, '')}\n"
+                        f"Delta: {row.get(contrast_label, '')}; p={row.get('p', '')}"
+                    ),
+                    axis=1
+                )
+                matrix_source = comparison_table.rename(
+                    columns={
+                        'Endpoint': 'endpoint',
+                        'C-peptide stratum': 'cpep_stratum'
+                    }
+                )
+                matrix_table = (
+                    matrix_source.pivot_table(
+                        index='endpoint',
+                        columns='cpep_stratum',
+                        values='cell_text',
+                        aggfunc='first',
+                        observed=False
+                    )
+                    .reindex(index=[e for e in figure_endpoints if e in set(matrix_source['endpoint'])])
+                    .reset_index()
+                    .rename(columns={'endpoint': 'Endpoint/strata'})
+                )
+                if matrix_table.empty:
+                    raise ValueError(f"{dataset_name}: adjusted means matrix table is empty.")
+                color_source = matrix_source.copy()
+                color_source['p_numeric'] = pd.to_numeric(
+                    color_source['p'].astype(str).str.replace('<', '', regex=False),
+                    errors='coerce'
+                )
+                color_source['cell_color'] = np.where(
+                    color_source['p_numeric'] < 0.05,
+                    '#d9ead3',
+                    '#ffffff'
+                )
+                color_matrix = (
+                    color_source.pivot_table(
+                        index='endpoint',
+                        columns='cpep_stratum',
+                        values='cell_color',
+                        aggfunc='first',
+                        observed=False
+                    )
+                    .reindex(index=[e for e in figure_endpoints if e in set(color_source['endpoint'])])
+                    .reset_index()
+                    .rename(columns={'endpoint': 'Endpoint/strata'})
+                )
+                color_matrix['Endpoint/strata'] = '#ffffff'
+                color_matrix = color_matrix.reindex(columns=matrix_table.columns)
+                self.plot_dataframe_table(
+                    matrix_table,
+                    dataset_plot_dir / 'model_adjusted_means_table.png',
+                    f'{dataset_name}: {contrast_label} contrasts by C-peptide stratum',
+                    font_size=6,
+                    cell_colors=color_matrix
+                )
+
+                self.plot_lmm_adjusted_means_by_stratum(
+                    dataset_df,
+                    str(dataset_name),
+                    endpoints_to_plot,
+                    stratum_labels,
+                    arm_labels,
+                    arm_order,
+                    arm_colors,
+                    dataset_plot_dir / 'model_adjusted_means.png'
+                )
+
+                for endpoint in endpoints_to_plot:
+                    self.plot_lmm_adjusted_means_by_stratum(
+                        dataset_df,
+                        str(dataset_name),
+                        [endpoint],
+                        stratum_labels,
+                        arm_labels,
+                        arm_order,
+                        arm_colors,
+                        dataset_plot_dir / f'{endpoint}.png'
+                    )
+
+            if stratify_by_age:
+                cutoff_label = (
+                    int(age_cutoff)
+                    if float(age_cutoff).is_integer()
+                    else str(age_cutoff).replace('.', '_')
+                )
+                strata_dirs = ['total', f'less_than_{cutoff_label}', f'{cutoff_label}_or_above']
+                desired_combined_filenames = (
+                    [
+                        'model_adjusted_means.png',
+                        'model_adjusted_means_table.png',
+                        'model1_fixed_effects_table.png',
+                        'model2_fixed_effects_table.png',
+                    ]
+                    + [f'{endpoint}.png' for endpoint in figure_endpoints]
+                )
+                for base_dataset_name in base_dataset_names:
+                    available_filenames = [
+                        filename
+                        for filename in desired_combined_filenames
+                        if all((plot_root / base_dataset_name / strata_dir / filename).exists() for strata_dir in strata_dirs)
+                    ]
+                    if not available_filenames:
+                        raise ValueError(
+                            f"{base_dataset_name}: no complete age-strata PNG triplets were available to combine."
+                        )
+                    self.combine_age_strata_pngs(
+                        graph_root=plot_root,
+                        dataset_names=[base_dataset_name],
+                        filenames=available_filenames,
+                        age_cutoff=age_cutoff
+                    )
+        else:
+            raise ValueError("No Model 2 estimated marginal means were produced.")
 
     def lmm_cpep_strata_arms_vs_reference(self) -> None:
         """
@@ -8334,14 +12133,16 @@ class DataAnalysis:
 
         return None
  
-    def lmm_cpep_strata_time_difference(
+    def lmm_time_adjusted_cpep_strata(
         self,
         df_t1d: pd.DataFrame | dd.DataFrame,
         *,
         full_formula: str,
         reduced_formula: str,
         trend_formula: str,
-        group_col: str
+        group_col: str,
+        output_name: str = 'cpepstrata_study_time_adjusted_means.csv',
+        output_dir: str | Path = './data/csv_results/lmm_results'
     ) -> None:
         """
         Fit mixed-effects models for C-peptide strata while adjusting for study and follow-up time.
@@ -8349,6 +12150,9 @@ class DataAnalysis:
         Uses pooled T1D study summaries, includes both study and continuous follow-up time in the fixed
         effects, adds a participant-level random intercept via `group_col`, and exports adjusted endpoint
         means together with omnibus and linear-trend tests across C-peptide strata.
+        Also exports a wide presentation table with strata as rows and endpoints
+        as columns, where each cell contains adjusted mean, 95% CI, omnibus p,
+        and trend p.
 
         Args:
             df_t1d: Pooled study-level dataframe for the entire cohort. Must include
@@ -8357,6 +12161,8 @@ class DataAnalysis:
             reduced_formula: Reduced fixed-effects formula evaluated per endpoint.
             trend_formula: Trend fixed-effects formula evaluated per endpoint.
             group_col: Column used for the participant-level random intercept grouping structure.
+            output_name: CSV filename for adjusted means and p-values.
+            output_dir: Folder where the adjusted-means CSV is saved.
 
         Returns:
             None
@@ -8477,8 +12283,36 @@ class DataAnalysis:
                 ordered=True
             )
             adjusted_means_df = adjusted_means_df.sort_values(['endpoint', 'cpep_stratum'])
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
             adjusted_means_df.to_csv(
-                './data/csv_results/lmm_results/cpepstrata_study_time_adjusted_means.csv',
+                output_dir / output_name,
+                index=False
+            )
+            presentation_df = adjusted_means_df.copy()
+            presentation_df['value'] = presentation_df.apply(
+                lambda row: (
+                    f"{row['adjusted_mean']} ({row['ci_lower']}, {row['ci_upper']}); "
+                    f"omnibus p: {row['p_value_omnibus']}; trend p: {row['p_value_trend']}"
+                ),
+                axis=1
+            )
+            presentation_wide = (
+                presentation_df
+                .pivot(index='cpep_stratum', columns='endpoint', values='value')
+                .reset_index()
+            )
+            endpoint_order = (
+                ['TIR', 'TITR', 'hb_a1c', 'gmi', 'GVP', 'TBR', 'TBR_Lvl_1', 'TBR_Lvl_2', 'TAR_Lvl_1', 'TAR_Lvl_2']
+            )
+            presentation_cols = (
+                ['cpep_stratum'] +
+                [col for col in endpoint_order if col in presentation_wide.columns] +
+                [col for col in presentation_wide.columns if col not in set(endpoint_order) | {'cpep_stratum'}]
+            )
+            presentation_wide = presentation_wide[presentation_cols]
+            presentation_wide.to_csv(
+                output_dir / f"{Path(output_name).stem}_wide.csv",
                 index=False
             )
         if not lrt_df.empty:
@@ -8490,393 +12324,229 @@ class DataAnalysis:
 
         return None
 
-    def lmm_cpep_x_treat(self, df_name, df) -> None:
-        """
-        Estimate simple C-peptide slopes within treatment arms from Model 1 mixed models.
-
-        For each CGM endpoint in the supplied dataset, this function is intended to fit
-        or reuse the continuous C-peptide treatment-interaction model, then extract the
-        C-peptide slope separately within each treatment arm.
-
-        Model 1 fixed-effects formula per endpoint:
-            - `endpoint ~ C(treatment_arm) + log_cpep_auc + C(treatment_arm):log_cpep_auc`
-            - If multiple studies are present, add `+ C(study)`
-            - Random intercept: supplied separately via `group_col='id'`
-            - Equivalent mixed-model notation:
-              `endpoint ~ ... + (1 | id)`
-
-        Simple slopes:
-            - Control arm slope: `beta(log_cpep_auc)`
-            - Active arm slope:
-              `beta(log_cpep_auc) + beta(C(treatment_arm)[T.1]:log_cpep_auc)`
-
-        Treatment arms are coded as:
-            - 0: control, using values in `TREATMENT_GROUP_1`
-            - 1: active, using values in `TREATMENT_GROUP_2`
-
-        Report for each dataset, endpoint, and treatment arm:
-            - Slope estimate
-            - 95% Wald confidence interval
-            - Wald p-value
-
-        Args:
-            df_name: Dataset label used in outputs, such as `cloud`, `clvr`, or
-                `cloud_clvr`.
-            df: Input dataset containing CGM data and model covariates.
-
-        Returns:
-            None
-        """
-        df = df.copy()
-        treatment_arm = df['treatment_arm'].astype('string').str.strip().str.lower()
-        df['treatment_arm'] = pd.Series(
-            np.select(
-                [
-                    treatment_arm.isin(TREATMENT_GROUP_1),
-                    treatment_arm.isin(TREATMENT_GROUP_2)
-                ],
-                [0, 1],
-                default=np.nan
-            ),
-            index=df.index
-        ).astype('Int64')
-        if df['treatment_arm'].dropna().nunique() < 2:
-            raise ValueError(
-                f"{df_name} requires both control and active treatment arms after recoding."
-            )
-
-        endpoints = self.get_taylor_patient_endpoints(
-            df,
-            metabolic_endpoints=CGM_CORE_ENDPOINTS,
-            by_time_bin=True,
-            include_cols={'study', 'cpep_auc', 'treatment_arm', 'insulin_delivery', 'gmi', 'hb_a1c'})
-        endpoints['treatment_arm'] = pd.to_numeric(
-            endpoints['treatment_arm'],
-            errors='coerce'
-        ).astype('Int64')
-        endpoints = endpoints.dropna(subset=['cpep_auc'])
-        if endpoints.empty:
-            raise ValueError(f"{df_name} has no endpoint rows with non-missing cpep_auc.")
-        if endpoints['treatment_arm'].dropna().nunique() < 2:
-            raise ValueError(
-                f"{df_name} endpoints require both control and active treatment arms."
-            )
-        endpoints['log_cpep_auc'] = np.log(endpoints['cpep_auc'] + 1)
-
-        model1_results = {}
-        model1_summary_rows = []
-        simple_slope_rows = []
-        agp_endpoints = sorted(set(CGM_CORE_ENDPOINTS) | {'gmi', 'hb_a1c'})
-        include_study = (
-            'study' in endpoints.columns and
-            endpoints['study'].nunique(dropna=True) > 1
-        )
-
-        for endpoint in agp_endpoints:
-            if endpoint not in endpoints.columns:
-                raise ValueError(f"{df_name} endpoints are missing required endpoint '{endpoint}'.")
-
-            model_cols = ['id', 'treatment_arm', 'log_cpep_auc', endpoint]
-            if include_study:
-                model_cols.append('study')
-            df_endpoint = endpoints[model_cols].dropna(
-                subset=['id', 'treatment_arm', 'log_cpep_auc', endpoint]
-            ).copy()
-            if df_endpoint.empty:
-                raise ValueError(
-                    f"{df_name} {endpoint} has no complete rows for Model 1."
-                )
-            if df_endpoint['treatment_arm'].nunique(dropna=True) < 2:
-                raise ValueError(
-                    f"{df_name} {endpoint} requires both treatment arms for Model 1."
-                )
-            df_endpoint['treatment_arm'] = df_endpoint['treatment_arm'].astype(int)
-
-            model1_formula = (
-                f"{endpoint} ~ C(treatment_arm) + log_cpep_auc + "
-                "C(treatment_arm):log_cpep_auc"
-            )
-            if include_study:
-                model1_formula += " + C(study)"
-
-            model1 = self.run_linear_mixed_model(
-                df=df_endpoint,
-                formula=model1_formula,
-                group_col='id',
-                reml=False
-            )
-            model1_results[(df_name, endpoint)] = model1
-            fe_params = model1.fe_params
-            conf_int = model1.conf_int().loc[fe_params.index]
-            pvals = model1.pvalues.loc[fe_params.index]
-            model1_table = pd.DataFrame({
-                'term': fe_params.index,
-                'estimate': fe_params.values,
-                'ci_lower': conf_int[0].values,
-                'ci_upper': conf_int[1].values,
-                'p_value': pvals.values
-            })
-            model1_table['dataset'] = df_name
-            model1_table['endpoint'] = endpoint
-            model1_summary_rows.append(model1_table)
-
-            cov_params = model1.cov_params()
-            if isinstance(cov_params, pd.DataFrame):
-                cov_fe = cov_params.loc[fe_params.index, fe_params.index]
-            else:
-                cov_fe = cov_params[:len(fe_params), :len(fe_params)]
-
-            cpep_term = 'log_cpep_auc'
-            interaction_terms = [
-                'C(treatment_arm)[T.1]:log_cpep_auc',
-                'log_cpep_auc:C(treatment_arm)[T.1]'
-            ]
-            interaction_term = next(
-                (term for term in interaction_terms if term in fe_params.index),
-                None
-            )
-            if cpep_term not in fe_params.index:
-                raise ValueError(
-                    f"{df_name} {endpoint} Model 1 is missing '{cpep_term}'."
-                )
-            if interaction_term is None:
-                raise ValueError(
-                    f"{df_name} {endpoint} Model 1 is missing the treatment-by-C-peptide interaction."
-                )
-
-            for treatment_arm, contrast_terms in [
-                ('control', {cpep_term: 1.0}),
-                ('active', {cpep_term: 1.0, interaction_term: 1.0})
-            ]:
-                contrast = np.zeros(len(fe_params))
-                for term, weight in contrast_terms.items():
-                    contrast[fe_params.index.get_loc(term)] = weight
-
-                estimate = float(contrast @ fe_params.to_numpy())
-                variance = float(contrast @ cov_fe.to_numpy() @ contrast.T)
-                if variance <= 0 or np.isnan(variance):
-                    se = np.nan
-                    ci_lower = np.nan
-                    ci_upper = np.nan
-                    p_value = np.nan
-                    status = 'invalid_standard_error'
-                else:
-                    se = float(np.sqrt(variance))
-                    z_score = estimate / se
-                    p_value = 2 * norm.sf(abs(z_score))
-                    ci_lower = estimate - 1.96 * se
-                    ci_upper = estimate + 1.96 * se
-                    status = 'ok'
-
-                simple_slope_rows.append({
-                    'dataset': df_name,
-                    'endpoint': endpoint,
-                    'treatment_arm': treatment_arm,
-                    'estimate': estimate,
-                    'standard_error': se,
-                    'ci_lower': ci_lower,
-                    'ci_upper': ci_upper,
-                    'p_value': p_value,
-                    'status': status
-                })
-
-        if not model1_summary_rows:
-            raise ValueError(f"{df_name} produced no Model 1 fixed-effect summaries.")
-        if not simple_slope_rows:
-            raise ValueError(f"{df_name} produced no simple-slope estimates.")
-
-        output_dir = Path('./data/csv_results/lmm_results/cpep_slopes_by_treatment')
-        if not output_dir.exists():
-            raise FileNotFoundError(f"Output directory does not exist: {output_dir}")
-        if not output_dir.is_dir():
-            raise NotADirectoryError(f"Output path is not a directory: {output_dir}")
-
-        model1_summary_df = pd.concat(model1_summary_rows, ignore_index=True)
-        model1_summary_df.to_csv(
-            output_dir / f'{df_name}_model1_fixed_effects.csv',
-            index=False
-        )
-
-        simple_slope_df = pd.DataFrame(simple_slope_rows)
-        simple_slope_df.to_csv(
-            output_dir / f'{df_name}_simple_slopes.csv',
-            index=False
-        )
-
-        return None
-
 if __name__ == '__main__':
     data_analysis = DataAnalysis()
 
-    ''' Loading datasets '''
-    # df_bandit = data_analysis.get_dataset('bandit')
+    # ------------------------------------------------------------------
+    # Loading datasets
+    # ------------------------------------------------------------------
+    df_bandit = data_analysis.get_dataset('bandit')
     df_cloud = data_analysis.get_dataset('cloud')
     df_clvr = data_analysis.get_dataset('clvr')
-    # df_defend = data_analysis.get_dataset('defend')
-    # df_diagnode = data_analysis.get_dataset('diagnode')
-    # df_gskalb = data_analysis.get_dataset('gskalb')
+    df_defend = data_analysis.get_dataset('defend')
+    df_diagnode = data_analysis.get_dataset('diagnode')
+    df_gskalb = data_analysis.get_dataset('gskalb')
     # df_itx = data_analysis.get_dataset('itx')
-    # df_jaeb_healthy = data_analysis.get_dataset('jaeb_healthy')
-    # df_jaeb_t1d = data_analysis.get_dataset('jaeb_t1d')
+    df_hupa_ucm = data_analysis.get_dataset('hupa_ucm')
+    df_jaeb_healthy = data_analysis.get_dataset('jaeb_healthy')
+    df_jaeb_t1d = data_analysis.get_dataset('jaeb_t1d')
 
-    # df_entire_data = pd.concat(
-    #     [
-    #         df_bandit.assign(study='bandit'),
-    #         df_cloud.assign(study='cloud'),
-    #         df_clvr.assign(study='clvr'),
-    #         df_defend.assign(study='defend'),
-    #         df_diagnode.assign(study='diagnode'),
-    #         df_gskalb.assign(study='gskalb'),
-    #         df_jaeb_t1d.assign(study='jaeb_t1d')
-    #     ],
-    #     ignore_index=True
-    # )
+    # ------------------------------------------------------------------
+    # Workstream 1: Whole data
+    # ------------------------------------------------------------------
+    # data_analysis.build_workstream_1_consort_graph()
 
-    df_cloud_clvr = pd.concat(
+    df_entire_data = pd.concat(
         [
+            df_bandit.assign(study='bandit'),
             df_cloud.assign(study='cloud'),
-            df_clvr.assign(study='clvr')
+            df_clvr.assign(study='clvr'),
+            df_defend.assign(study='defend'),
+            df_diagnode.assign(study='diagnode'),
+            df_gskalb.assign(study='gskalb'),
+            df_jaeb_t1d.assign(study='jaeb_t1d')
         ],
         ignore_index=True
     )
 
-    ''' Printing dataset summaries '''
-    # data_analysis.print_summaries()
+    # --- 1. Data inventory: insulin dosing ---
+    # data_analysis.print_insulin_inventory(
+    #     output_dir='./data/csv_results/workstream_1/task_1_insulin_inventory'
+    # )
 
-    '''Printing data inventory and metadata: '''
-    # data_analysis.best_cgm_pct_wear_and_days()
-    # data_analysis.check_cgm_pct_wear(ALL_STUDIES)
-    # data_analysis.print_AGP()
-    # data_analysis.plot_AGP_random_subject_all_windows()
-    # data_analysis.print_feature_availability_table()
-    # data_analysis.print_valid_durations()
-    # data_analysis.print_feature_histograms()
-    # data_analysis.print_feature_isi_histograms()
-    # data_analysis.print_characteristics_table_baseline()
-    # data_analysis.print_good_days()
-    # data_analysis.print_insulin_inventory()
-    # data_analysis.print_metadata()
+    # --- 2. Data inventory: technology use ---
+    data_analysis.print_metadata(
+        output_dir='./data/csv_results/workstream_1/task_2_technology_use'
+    )
 
-    '''Hypoglycemia rates statistics '''
-    # # print(hypo_rate_statistics)
+    # --- 3. Baseline characteristics table ---
+    # data_analysis.print_characteristics_table_baseline(
+    #     df=df_entire_data,
+    #     output_name='baseline_table_workstream1.csv',
+    #     reference_datasets=[
+    #         ('jaeb_healthy', df_jaeb_healthy),
+    #         ('hupa_ucm', df_hupa_ucm)
+    #     ],
+    #     output_dir='./data/csv_results/workstream_1/task_3_baseline_characteristics',
+    #     split_group_columns='treatment_arm'
+    # )
 
-    '''Hypothesis test: Length of Line'''
-    # data_analysis.hypothesis_test_LoL()
-
-    '''Hypothesis test: CGM core endpoints GENERAL'''
-    # data_analysis.ht_CGM_general()
-
-    '''Hypothesis test: CGM core endpoints TIME BINS'''
-    # data_analysis.ht_CGM_time_bins()
-
-    '''Hypothesis test: CGM core endpoints vs Time (seperated by treatment arms)'''
-    # data_analysis.ht_CGM_treatment_arms()
-
-    '''Hypothesis test: CGM core endpoints vs Time (seperated by daytime type)'''
-    # data_analysis.ht_CGM_daytime_type()
-
-    '''Hypothesis test: Correlation CGM and CPEP AUC, CGM and Beta2 Score'''
-    # data_analysis.ht_clinical_features()
-
-    '''Hypothesis test: Correlation CGM and CPEP AUC, CGM and Beta2 Score (seperated by treatment arms)'''
-    # data_analysis.ht_clinical_features_treatment_arms()
-
-    '''Hypothesis test: Correlation CGM and CPEP AUC, CGM and Beta2 Score (seperated by daytime type)'''
-    # data_analysis.ht_clinical_features_daytime_type()
-
-    '''Hypothesis test: CGM core endpoints difference among CPEP strata'''
-    # data_analysis.ht_cpep_strata()
-
-    '''Boxplot hypoglycemia rates'''
-    # data_analysis.plot_analyzed_features_general('prc_hypoglycemia_level_1')
-    # data_analysis.plot_analyzed_features_general('prc_hypoglycemia_level_2')
-    # data_analysis.plot_analyzed_features_general('prc_cl_sig_hypo')
-
-    '''Taylor Analysis: '''
-    # data_analysis.taylor_analysis()
-    # data_analysis.combine_pngs('./data/graphs/feature_analysis/AGP/cloud/beta2_score/', './data/graphs/feature_analysis/AGP/cloud/beta2_score/combined.png', cols=2)
-
-    '''Entire Cohor: Control vs Treatment (Fasting Glucose, GMI, HbA1C, Beta2, Beta3)'''
-    # data_analysis.a1c_vs_gmi_treatment_arms()
-
-    '''
-    Linear mixed effect modelling for c-peptide strata comparisons:
-        - Full fixed-effects formula: `endpoint ~ C(cpep_stratum) + C(study)`
-        - Reduced fixed-effects formula: `endpoint ~ C(study)`
-        - Trend fixed-effects formula: `endpoint ~ cpep_stratum_num + C(study)`
-        - Random intercept: supplied separately via `group_col='id'`
-        - Equivalent mixed-model notation: `endpoint ~ ... + (1 | id)`
-    '''
-    # data_analysis.lmm_cpep_between_strata()
-
-    '''
-    LMM formulas per endpoint:
-        - Model 1 fixed-effects formula:
-          `endpoint ~ C(treatment_arm) + log_cpep_auc + C(treatment_arm):log_cpep_auc`
-        - Model 2 fixed-effects formula:
-          `endpoint ~ C(treatment_arm) + C(cpep_stratum) + C(treatment_arm):C(cpep_stratum)`
-        - If multiple studies are present, both models add `+ C(study)`
-        - Random intercept: supplied separately via `group_col='id'`
-        - Equivalent mixed-model notation: `endpoint ~ ... + (1 | id)`
-    '''
-    # data_analysis.lmm_cpep_cont_vs_strata()
-
-    '''
-    LMM formula per endpoint within each stratum:
-        - Fixed-effects formula: `endpoint ~ C(group)`
-        - Random intercept: supplied separately via `group_col='id'`
-        - Equivalent mixed-model notation: `endpoint ~ C(group) + (1 | id)`
-
-    Contrasts are reported for:
-        - `active - established`
-        - `control - established`
-        - `active - healthy`
-        - `control - healthy`
-    '''
-    # data_analysis.lmm_cpep_strata_arms_vs_reference()
-
-    '''
-    LMM formulas per endpoint for entire data:
-        - Full fixed-effects formula: `endpoint ~ C(cpep_stratum) + C(study) + time_months`
-        - Reduced fixed-effects formula: `endpoint ~ C(study) + time_months`
-        - Trend fixed-effects formula: `endpoint ~ cpep_stratum_num + C(study) + time_months`
-        - Random intercept: supplied separately via `group_col='id'`
-        - Equivalent mixed-model notation: `endpoint ~ ... + (1 | id)`
-    '''
-    # data_analysis.lmm_cpep_strata_time_difference(
+    # --- 4. Time-adjustment analysis ---
+    # data_analysis.lmm_time_adjusted_cpep_strata(
     #     df_entire_data,
     #     full_formula="endpoint ~ C(cpep_stratum) + C(study) + time_months",
     #     reduced_formula="endpoint ~ C(study) + time_months",
     #     trend_formula="endpoint ~ cpep_stratum_num + C(study) + time_months",
-    #     group_col='id'
+    #     group_col='id',
+    #     output_name='cpepstrata_study_time_adjusted_means.csv',
+    #     output_dir='./data/csv_results/workstream_1/task_4_time_adjustment'
     # )
 
-    '''
-    Simple C-peptide slopes within treatment arms for CLOUD, CLVR, and pooled CLOUD+CLVR:
-        - Model 1 fixed-effects formula:
-          `endpoint ~ C(treatment_arm) + log_cpep_auc + C(treatment_arm):log_cpep_auc`
-        - Pooled CLOUD+CLVR models add `+ C(study)`
-        - Random intercept: supplied separately via `group_col='id'`
-        - Treatment coding: control = 0, active = 1
-        - Control slope: `beta(log_cpep_auc)`
-        - Active slope: `beta(log_cpep_auc) + beta(C(treatment_arm)[T.1]:log_cpep_auc)`
-    '''
-    data_analysis.lmm_cpep_x_treat('cloud', df_cloud)
-    data_analysis.lmm_cpep_x_treat('clvr', df_clvr)
-    data_analysis.lmm_cpep_x_treat('cloud_clvr', df_cloud_clvr)
+    # --- 5. Age-stratified analyses ---
+    # age_cutoff = 18
+    # if 'age' not in df_entire_data.columns:
+    #     raise ValueError("Age-stratified analyses require an 'age' column.")
+    # age_source = df_entire_data[['id', 'age']].copy()
+    # if 'timestamp' in df_entire_data.columns:
+    #     age_source['timestamp'] = df_entire_data['timestamp']
+    #     age_source = age_source.sort_values(['id', 'timestamp'])
+    # else:
+    #     age_source = age_source.sort_values(['id'])
+    # age_source['age_numeric'] = pd.to_numeric(age_source['age'], errors='coerce')
 
-    '''
-    LMM formulas per endpoint for CLOUD/CLVR:
-        - Full fixed-effects formula: `endpoint ~ C(cpep_stratum) + C(study) + time_months`
-        - Reduced fixed-effects formula: `endpoint ~ C(study) + time_months`
-        - Trend fixed-effects formula: `endpoint ~ cpep_stratum_num + C(study) + time_months`
-        - Random intercept: supplied separately via `group_col='id'`
-        - Equivalent mixed-model notation: `endpoint ~ ... + (1 | id)`
-    '''
-    # data_analysis.lmm_cpep_strata_time_difference(
-    #     df_cloud_clvr,
+    # participant_age_values = (
+    #     age_source
+    #     .dropna(subset=['id', 'age_numeric'])
+    #     .groupby('id')['age_numeric']
+    #     .agg(['min', 'max', 'first'])
+    # )
+    # crossing_age_ids = sorted(
+    #     participant_age_values[
+    #         (participant_age_values['min'] < age_cutoff)
+    #         & (participant_age_values['max'] >= age_cutoff)
+    #     ].index.astype(str).tolist()
+    # )
+    # if crossing_age_ids:
+    #     warnings.warn(
+    #         "Age-stratified analyses found participants crossing the pediatric/adult cutoff during follow-up; "
+    #         "they are assigned using first observed age: "
+    #         f"{crossing_age_ids}",
+    #         UserWarning
+    #     )
+
+    # all_ids = set(df_entire_data['id'].dropna().astype(str).unique())
+    # ids_with_age = set(participant_age_values.index.astype(str))
+    # missing_age_ids = sorted(all_ids - ids_with_age)
+    # if missing_age_ids:
+    #     warnings.warn(
+    #         "Age-stratified analyses are dropping participants with no age available anywhere: "
+    #         f"{missing_age_ids}",
+    #         UserWarning
+    #     )
+
+    # df_age_stratified = df_entire_data[df_entire_data['id'].astype(str).isin(ids_with_age)].copy()
+    # df_age_stratified['age_stratification_age'] = (
+    #     df_age_stratified['id'].map(participant_age_values['first'])
+    # )
+    # df_under_18 = df_age_stratified[df_age_stratified['age_stratification_age'] < age_cutoff].copy()
+    # df_18_plus = df_age_stratified[df_age_stratified['age_stratification_age'] >= age_cutoff].copy()
+
+    # data_analysis.lmm_time_adjusted_cpep_strata(
+    #     df_under_18,
     #     full_formula="endpoint ~ C(cpep_stratum) + C(study) + time_months",
     #     reduced_formula="endpoint ~ C(study) + time_months",
     #     trend_formula="endpoint ~ cpep_stratum_num + C(study) + time_months",
-    #     group_col='id'
+    #     group_col='id',
+    #     output_name='cpepstrata_study_time_adjusted_means_under_18.csv',
+    #     output_dir='./data/csv_results/workstream_1/task_5_age_stratified'
     # )
+    # data_analysis.lmm_time_adjusted_cpep_strata(
+    #     df_18_plus,
+    #     full_formula="endpoint ~ C(cpep_stratum) + C(study) + time_months",
+    #     reduced_formula="endpoint ~ C(study) + time_months",
+    #     trend_formula="endpoint ~ cpep_stratum_num + C(study) + time_months",
+    #     group_col='id',
+    #     output_name='cpepstrata_study_time_adjusted_means_18_plus.csv',
+    #     output_dir='./data/csv_results/workstream_1/task_5_age_stratified'
+    # )
+
+    # --- 7. Insulin regimen as outcome ---
+    # TODO: Add regimen outcome analysis for studies with basal/bolus regimen data.
+
+    # --- Other whole-data checks and supporting outputs ---
+    # data_analysis.best_cgm_pct_wear_and_days()
+    # data_analysis.check_cgm_pct_wear(ALL_STUDIES)
+    # data_analysis.print_feature_availability_table()
+    # data_analysis.print_repeated_clinical_feature_time_bins()
+    # data_analysis.print_summaries()
+
+    # ------------------------------------------------------------------
+    # Workstream 2: CLOUD/CLVR data
+    # ------------------------------------------------------------------
+    # data_analysis.build_workstream_2_consort_graph()
+
+    # df_cloud_clvr = pd.concat(
+    #     [
+    #         df_cloud.assign(study='cloud'),
+    #         df_clvr.assign(study='clvr')
+    #     ],
+    #     ignore_index=True
+    # )
+    
+    # --- 1. Baseline characteristics table ---
+    # data_analysis.print_characteristics_table_baseline(
+    #     df=df_cloud_clvr,
+    #     output_name='baseline_table_workstream2.csv',
+    #     reference_datasets=[
+    #         ('jaeb_healthy', df_jaeb_healthy),
+    #         ('hupa_ucm', df_hupa_ucm)
+    #     ],
+    #     output_dir='./data/csv_results/workstream_2/task_1_baseline_characteristics',
+    #     p_value_group_names=('cloud', 'clvr')
+    # )
+
+    # --- 2. Raw metabolic endpoints by C-peptide strata ---
+    # data_analysis.cpep_strata_raw_endpoint_analysis(
+    #     csv_output_root='./data/csv_results/workstream_2/task_2_cpep_strata_raw',
+    #     graph_output_root='./data/graphs/workstream_2/task_2_cpep_strata_raw'
+    # )
+
+    # --- 2.1 C-peptide strata by treatment-arm interaction ---
+    # data_analysis.lmm_cpep_interaction(
+    #     datasets=[
+    #         ('cloud', df_cloud),
+    #         ('clvr', df_clvr),
+    #         ('cloud_clvr', df_cloud_clvr)
+    #     ],
+    #     csv_root='./data/csv_results/workstream_2/task_2_1_treatment_interaction',
+    #     graph_root='./data/graphs/workstream_2/task_2_1_treatment_interaction',
+    #     model1_csv_root='./data/csv_results/workstream_2/task_3_simple_slopes',
+    #     stratify_by_age=True,
+    #     age_cutoff=13,
+    #     exclude_endpoints=['TBR_Lvl_1', 'TBR_Lvl_2']
+    # )
+
+    # --- 2.2 CLOUD combined vs CLVR combined ---
+    # data_analysis.lmm_cpep_interaction(
+    #     datasets=[
+    #         ('cloud_vs_clvr_combined', df_cloud_clvr)
+    #     ],
+    #     csv_root='./data/csv_results/workstream_2/task_2_2_cloud_vs_clvr_combined',
+    #     graph_root='./data/graphs/workstream_2/task_2_2_cloud_vs_clvr_combined',
+    #     model1_csv_root='./data/csv_results/workstream_2/task_3_simple_slopes/cloud_vs_clvr_combined',
+    #     stratify_by_age=True,
+    #     age_cutoff=13,
+    #     exclude_endpoints=['TBR_Lvl_1', 'TBR_Lvl_2'],
+    #     comparison_source='study',
+    #     reference_values=['cloud'],
+    #     comparison_values=['clvr'],
+    #     reference_label='CLOUD',
+    #     comparison_label='CLVR',
+    #     comparison_name='study'
+    # )
+
+
+    # --- 2.3 Insulin regimen as outcome ---
+    # TODO: Add basal vs basal+bolus outcome analysis.
+
+    # --- 3. Simple slopes analysis ---
+    # Saved by lmm_cpep_interaction from the same Model 1 fits.
+
+    # --- 4. AGP by C-peptide strata and reference AGPs ---
+    # data_analysis.print_workstream_2_AGP(
+    #     graph_output_root='./data/graphs/workstream_2/task_4_agp'
+    # )
+
+    # ------------------------------------------------------------------
+    # Taylor Analysis
+    # ------------------------------------------------------------------
